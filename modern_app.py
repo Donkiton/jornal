@@ -10,11 +10,11 @@ import sys
 from datetime import date, datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, QTime, Qt
+from PySide6.QtGui import QColor, QIcon, QPainterPath, QRegion
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QComboBox, QFileDialog, QFrame, QGridLayout,
-    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QApplication, QButtonGroup, QComboBox, QDialog, QFileDialog, QFrame, QGridLayout,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
     QMainWindow, QMessageBox, QPushButton, QRadioButton, QScrollArea,
     QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
@@ -22,49 +22,213 @@ from PySide6.QtWidgets import (
 
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 CONFIG_PATH, BACKUP_DIR, DEFAULT_DB = APP_DIR / "settings.json", APP_DIR / "backups", APP_DIR / "data" / "journal.db"
+ICON_DIR = APP_DIR / "assets" / "icons"
 PAGE_SIZE = 10
 DEFAULT_SETTINGS = {
     "db_path": str(DEFAULT_DB), "last_backup_week": "",
     "anesthesia_types": ["Общая эндотрахеальная", "Спинальная", "Местная", "Проводниковая", "Седация"],
     "doctors": ["Смирнов И. П.", "Соколов Д. А.", "Павлов Р. А."],
     "nurses": ["Кузнецова О. В.", "Морозова Т. С.", "Иванова Е. П."],
+    "reference_dialog_size": [560, 300],
 }
 
 
 QSS = """
-* { font-family: 'Segoe UI'; color: #20304a; }
-QMainWindow, QWidget#root { background: #f6f8fc; }
-QFrame#sidebar { background: white; border-right: 1px solid #e6eaf1; }
-QFrame#card { background: white; border: 1px solid #e7ebf2; border-radius: 16px; }
-QLabel#title { font-size: 27px; font-weight: 700; color: #17233b; letter-spacing: -0.6px; }
-QLabel#muted { color: #748198; font-size: 12px; }
-QLabel#section { font-size: 14px; font-weight: 700; color: #25324b; }
-QPushButton { border: 0; border-radius: 9px; padding: 9px 12px; font-size: 13px; background: transparent; }
-QPushButton:hover { background: #f1f5fb; }
-QPushButton:pressed { background: #e2ecfc; }
-QPushButton#nav { text-align: left; padding: 11px 14px; color: #53617a; }
-QPushButton#nav:checked { background: #eaf2ff; color: #1769e0; font-weight: 600; }
-QPushButton#primary { background: #1769e0; color: white; font-weight: 600; padding: 10px 14px; }
-QPushButton#primary:hover { background: #0e5dc9; }
-QPushButton#primary:disabled { background: #c9d8ee; color: #f7fbff; }
-QPushButton#outline { border: 1px solid #dfe6f0; background: white; color: #1769e0; font-weight: 600; }
+* { font-family: '-apple-system', 'Segoe UI Variable', 'Segoe UI'; color: #1d1d1f; }
+QMainWindow { background: #f5f5f7; }
+QWidget#root { background: #f5f5f7; border: 1px solid #dedee3; border-radius: 10px; }
+QFrame#titlebar { background: #f8f8fa; border-bottom: 1px solid #e5e5ea; border-top-left-radius: 10px; border-top-right-radius: 10px; }
+QWidget#shell { background: #f5f5f7; border-bottom-left-radius: 10px; border-bottom-right-radius: 10px; }
+QLabel#windowTitle { color: #1d1d1f; font-size: 13px; font-weight: 700; }
+QLabel#windowSubtitle { color: #8e8e93; font-size: 10px; }
+QLabel#connectionChip { color: #6e6e73; font-size: 11px; padding: 2px 8px; }
+QPushButton#closeControl, QPushButton#minimizeControl, QPushButton#maximizeControl { border-radius: 6px; min-width: 12px; max-width: 12px; min-height: 12px; max-height: 12px; padding: 0; }
+QPushButton#closeControl { background: #ff5f57; border: 1px solid #e0443e; }
+QPushButton#minimizeControl { background: #ffbd2e; border: 1px solid #dfa321; }
+QPushButton#maximizeControl { background: #28c840; border: 1px solid #1faa35; }
+QPushButton#closeControl:hover { background: #ff7770; }
+QPushButton#minimizeControl:hover { background: #ffcd5c; }
+QPushButton#maximizeControl:hover { background: #55d369; }
+QFrame#sidebar { background: #f8f8fa; border-right: 1px solid #e5e5ea; border-bottom-left-radius: 10px; }
+QFrame#card { background: #ffffff; border: 1px solid #e5e5ea; border-radius: 14px; }
+QLabel#title { font-size: 28px; font-weight: 700; color: #1d1d1f; letter-spacing: -0.7px; }
+QLabel#muted { color: #6e6e73; font-size: 12px; }
+QLabel#section { font-size: 14px; font-weight: 700; color: #1d1d1f; }
+QPushButton { border: 0; border-radius: 8px; padding: 9px 12px; font-size: 13px; background: transparent; }
+QPushButton:hover { background: #ececf0; }
+QPushButton:pressed { background: #e0e0e5; }
+QPushButton#nav { text-align: left; padding: 10px 12px; color: #515154; }
+QPushButton#nav:hover { color: #007aff; }
+QPushButton#nav:checked { background: #e8f1ff; color: #007aff; font-weight: 600; }
+QPushButton#primary { background: #007aff; color: white; font-weight: 600; padding: 10px 14px; }
+QPushButton#primary:hover { background: #0071e3; }
+QPushButton#primary:disabled { background: #c7d8ee; color: #f7fbff; }
+QPushButton#outline { border: 1px solid #d2d2d7; background: white; color: #007aff; font-weight: 600; }
 QPushButton#outline:hover { background: #f4f8ff; }
-QLineEdit, QComboBox { background: white; border: 1px solid #dfe6ef; border-radius: 9px; padding: 8px 10px; min-height: 20px; }
-QLineEdit:focus, QComboBox:focus { border: 2px solid #80b0f2; }
-QLineEdit:disabled, QComboBox:disabled { background: #f5f7fa; color: #9aa6b8; }
+QPushButton#danger { background: #d1544d; color: white; font-weight: 600; }
+QPushButton#danger:hover { background: #bb433e; }
+QPushButton#danger:pressed { background: #a83834; }
+QLineEdit, QComboBox { background: white; border: 1px solid #d2d2d7; border-radius: 8px; padding: 8px 10px; min-height: 20px; }
+QLineEdit:focus, QComboBox:focus { border: 2px solid #007aff; }
+QLineEdit:disabled, QComboBox:disabled { background: #f2f2f7; color: #8e8e93; }
+QLineEdit[invalidTime="true"] { border: 2px solid #ff3b30; background: #fff8f7; }
+QDialog#referenceDialog { background: #4d5562; border: 0; border-radius: 10px; }
+QFrame#dialogTitlebar { background: #f8f8fa; border-bottom: 1px solid #e5e5ea; border-top-left-radius: 10px; border-top-right-radius: 10px; }
+QLabel#dialogWindowTitle { color: #1d1d1f; font-size: 12px; font-weight: 700; }
+QWidget#dialogBody { background: #f5f5f7; border-bottom-left-radius: 10px; border-bottom-right-radius: 10px; }
+QFrame#dialogContent { background: white; border: 1px solid #e5e5ea; border-radius: 14px; }
+QLabel#dialogEyebrow { color: #6e6e73; font-size: 11px; font-weight: 600; }
+QLabel#dialogTitle { color: #1d1d1f; font-size: 20px; font-weight: 700; }
 QComboBox::drop-down { border: 0; width: 25px; }
-QTableWidget { background: white; border: none; gridline-color: #edf0f5; selection-background-color: #eaf2ff; selection-color: #17233b; font-size: 12px; }
-QHeaderView::section { background: #fbfcfe; border: none; border-bottom: 1px solid #e7ebf2; color: #65738a; font-size: 11px; font-weight: 600; padding: 11px 8px; }
-QTableWidget::item { border-bottom: 1px solid #edf0f5; padding: 7px; }
-QScrollBar:horizontal { height: 10px; background: transparent; }
-QScrollBar::handle:horizontal { background: #c5ccd8; min-width: 40px; border-radius: 5px; }
-QListWidget { border: 1px solid #e1e6ef; border-radius: 9px; padding: 3px; background: white; }
-QListWidget::item { padding: 9px; border-bottom: 1px solid #edf0f5; }
-QListWidget::item:selected { background: #eaf2ff; color: #1769e0; border-radius: 5px; }
-QRadioButton { padding: 8px 10px; border: 1px solid #dfe6ef; border-radius: 8px; background: white; }
+QTableWidget { background: white; border: none; gridline-color: #f0f0f2; selection-background-color: #e8f1ff; selection-color: #1d1d1f; font-size: 12px; }
+QHeaderView::section { background: #fbfbfc; border-top: 0; border-left: 0; border-right: 1px solid #c2c6ce; border-bottom: 1px solid #d5d8de; color: #535761; font-size: 11px; font-weight: 600; padding: 11px 8px; }
+QHeaderView::section:hover { background: #f1f4f8; border-right: 2px solid #8f96a3; color: #1d1d1f; }
+QTableWidget::item { border-bottom: 1px solid #f0f0f2; padding: 7px; }
+QScrollBar { background: transparent; margin: 0; }
+QScrollBar:horizontal { height: 10px; }
+QScrollBar:vertical { width: 10px; }
+QScrollBar::handle:horizontal, QScrollBar::handle:vertical { background: #c7c7cc; border-radius: 5px; }
+QScrollBar::handle:horizontal { min-width: 40px; }
+QScrollBar::handle:vertical { min-height: 40px; }
+QScrollBar::handle:hover { background: #aeaeb2; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+QListWidget { border: 1px solid #d2d2d7; border-radius: 8px; padding: 3px; background: white; }
+QListWidget::item { padding: 9px; border-bottom: 1px solid #f0f0f2; }
+QListWidget::item:selected { background: #e8f1ff; color: #007aff; border-radius: 5px; }
+QRadioButton { padding: 8px 10px; border: 1px solid #d2d2d7; border-radius: 8px; background: white; }
 QRadioButton::indicator { width: 0; height: 0; }
-QRadioButton:checked { background: #eaf2ff; border-color: #a8c8f5; color: #1769e0; font-weight: 600; }
+QRadioButton:checked { background: #e8f1ff; border-color: #8ec4ff; color: #007aff; font-weight: 600; }
 """
+
+
+class TitleBar(QFrame):
+    """Перетаскиваемая пользовательская верхняя панель окна Windows."""
+    def __init__(self, window: "JournalWindow") -> None:
+        super().__init__()
+        self.window = window
+        self.drag_offset: QPoint | None = None
+        self.setObjectName("titlebar")
+        self.setFixedHeight(42)
+        self.setMouseTracking(True)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 0, 16, 0)
+        layout.setSpacing(0)
+
+        status_area = QWidget()
+        status_area.setFixedWidth(160)
+        status_layout = QHBoxLayout(status_area)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        status_layout.setSpacing(0)
+        self.connection_chip = QLabel("● Проверка базы")
+        self.connection_chip.setObjectName("connectionChip")
+        status_layout.addWidget(self.connection_chip)
+        status_layout.addStretch()
+        layout.addWidget(status_area)
+        layout.addStretch(1)
+
+        title = QLabel("Журнал пациентов")
+        title.setObjectName("windowTitle")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+        layout.addStretch(1)
+
+        controls = QWidget()
+        controls.setFixedWidth(160)
+        control_layout = QHBoxLayout(controls)
+        control_layout.setContentsMargins(0, 0, 0, 0)
+        control_layout.setSpacing(8)
+        self.maximize = self.control("Развернуть окно", self.window.toggle_maximized, "maximizeControl")
+        minimize = self.control("Свернуть окно", self.window.showMinimized, "minimizeControl")
+        close = self.control("Закрыть окно", self.window.close, "closeControl")
+        control_layout.addStretch()
+        control_layout.addWidget(self.maximize)
+        control_layout.addWidget(minimize)
+        control_layout.addWidget(close)
+        layout.addWidget(controls)
+
+    @staticmethod
+    def control(tooltip: str, slot, object_name: str) -> QPushButton:
+        button = QPushButton()
+        button.setObjectName(object_name)
+        button.setToolTip(tooltip)
+        button.setAccessibleName(tooltip)
+        button.clicked.connect(slot)
+        return button
+
+    def set_connection_state(self, available: bool) -> None:
+        if available:
+            self.connection_chip.setText("● Локальная база")
+            self.connection_chip.setStyleSheet("")
+        else:
+            self.connection_chip.setText("● База недоступна")
+            self.connection_chip.setStyleSheet("color:#c05c00;")
+
+    def update_maximize_control(self, maximized: bool) -> None:
+        self.maximize.setToolTip("Восстановить размер окна" if maximized else "Развернуть окно")
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and not self.window.isMaximized():
+            self.drag_offset = event.globalPosition().toPoint() - self.window.frameGeometry().topLeft()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self.drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.window.move(event.globalPosition().toPoint() - self.drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self.drag_offset = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.window.toggle_maximized()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+class TimeField(QLineEdit):
+    """Поле необязательного времени с явным разбором значения через QTime."""
+    def __init__(self) -> None:
+        super().__init__()
+        self.setPlaceholderText("ЧЧ:ММ")
+        self.setMaxLength(5)
+        self.textEdited.connect(self.clear_invalid_state)
+        self.editingFinished.connect(self.normalize)
+
+    def parsed_time(self) -> QTime | None:
+        value = self.text().strip()
+        if not value:
+            return None
+        for format_string in ("HH:mm", "H:mm"):
+            parsed = QTime.fromString(value, format_string)
+            if parsed.isValid():
+                return parsed
+        return None
+
+    def clear_invalid_state(self) -> None:
+        self.setProperty("invalidTime", False)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def normalize(self) -> None:
+        value = self.text().strip()
+        parsed = self.parsed_time()
+        if not value:
+            self.clear_invalid_state()
+        elif parsed:
+            self.setText(parsed.toString("HH:mm"))
+            self.clear_invalid_state()
+        else:
+            self.setProperty("invalidTime", True)
+            self.style().unpolish(self)
+            self.style().polish(self)
 
 
 class DataStore:
@@ -81,6 +245,9 @@ class DataStore:
         settings = {**DEFAULT_SETTINGS, **source}
         for key in ("anesthesia_types", "doctors", "nurses"):
             settings[key] = settings[key] if isinstance(settings.get(key), list) else DEFAULT_SETTINGS[key].copy()
+        dialog_size = settings.get("reference_dialog_size")
+        if not (isinstance(dialog_size, list) and len(dialog_size) == 2 and all(isinstance(value, int) and value > 0 for value in dialog_size)):
+            settings["reference_dialog_size"] = DEFAULT_SETTINGS["reference_dialog_size"].copy()
         return settings
 
     def save_settings(self) -> None:
@@ -137,12 +304,228 @@ class DataStore:
         self.save_settings()
 
 
+class DialogTitleBar(QFrame):
+    """Компактная macOS-панель для модальных окон приложения."""
+    def __init__(self, dialog: QDialog, title: str) -> None:
+        super().__init__()
+        self.dialog = dialog
+        self.drag_offset: QPoint | None = None
+        self.setObjectName("dialogTitlebar")
+        self.setFixedHeight(42)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 0, 16, 0)
+        layout.setSpacing(0)
+
+        spacer = QWidget()
+        spacer.setFixedWidth(120)
+        layout.addWidget(spacer)
+        layout.addStretch(1)
+
+        label = QLabel(title)
+        label.setObjectName("dialogWindowTitle")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(label)
+        layout.addStretch(1)
+
+        controls = QWidget()
+        controls.setFixedWidth(120)
+        control_layout = QHBoxLayout(controls)
+        control_layout.setContentsMargins(0, 0, 0, 0)
+        control_layout.setSpacing(8)
+        control_layout.addStretch()
+        close = QPushButton()
+        close.setObjectName("closeControl")
+        close.setToolTip("Закрыть окно")
+        close.setAccessibleName("Закрыть окно")
+        close.clicked.connect(self.dialog.reject)
+        control_layout.addWidget(close)
+        layout.addWidget(controls)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_offset = event.globalPosition().toPoint() - self.dialog.frameGeometry().topLeft()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self.drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.dialog.move(event.globalPosition().toPoint() - self.drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self.drag_offset = None
+        super().mouseReleaseEvent(event)
+
+
+class ReferenceValueDialog(QDialog):
+    """Безрамочный диалог добавления и изменения справочника в стиле приложения."""
+    def __init__(self, action: str, reference_title: str, value: str, saved_size: list[int], parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setObjectName("referenceDialog")
+        self.setWindowTitle(f"{action} · {reference_title}")
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setMinimumSize(480, 320)
+        self.resize(*saved_size)
+
+        outer = QVBoxLayout(self)
+        # Оставляем отдельную полосу внешнего контура: дочерние виджеты
+        # не могут перекрыть её своей заливкой.
+        outer.setContentsMargins(1, 1, 1, 1)
+        outer.setSpacing(0)
+        self.titlebar = DialogTitleBar(self, f"{action} · {reference_title}")
+        outer.addWidget(self.titlebar)
+
+        body = QWidget()
+        body.setObjectName("dialogBody")
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(20, 20, 20, 20)
+        content = QFrame()
+        content.setObjectName("dialogContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(10)
+
+        eyebrow = QLabel(reference_title.upper())
+        eyebrow.setObjectName("dialogEyebrow")
+        title = QLabel(action)
+        title.setObjectName("dialogTitle")
+        prompt = QLabel("Введите значение для справочника")
+        prompt.setObjectName("muted")
+        self.input = QLineEdit(value)
+        self.input.setPlaceholderText("Например, новое значение")
+        self.input.setClearButtonEnabled(True)
+        self.input.returnPressed.connect(self.accept)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        cancel = QPushButton("Отмена")
+        cancel.setObjectName("outline")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("Сохранить")
+        save.setObjectName("primary")
+        save.clicked.connect(self.accept)
+        actions.addWidget(cancel)
+        actions.addWidget(save)
+
+        layout.addWidget(eyebrow)
+        layout.addWidget(title)
+        layout.addWidget(prompt)
+        layout.addWidget(self.input)
+        layout.addLayout(actions)
+        body_layout.addWidget(content)
+        outer.addWidget(body, 1)
+        self.input.setFocus()
+        self.update_window_mask()
+        for widget in self.findChildren(QWidget):
+            widget.setMouseTracking(True)
+            widget.installEventFilter(self)
+
+    def update_window_mask(self) -> None:
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), 10, 10)
+        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.update_window_mask()
+
+    def eventFilter(self, source, event) -> bool:
+        if event.type() not in (QEvent.Type.MouseMove, QEvent.Type.MouseButtonPress) or not hasattr(event, "globalPosition"):
+            return super().eventFilter(source, event)
+        point = self.mapFromGlobal(event.globalPosition().toPoint())
+        margin, width, height = 7, self.width(), self.height()
+        edges = Qt.Edge(0)
+        if point.x() <= margin: edges |= Qt.Edge.LeftEdge
+        elif point.x() >= width - margin: edges |= Qt.Edge.RightEdge
+        if point.y() <= margin: edges |= Qt.Edge.TopEdge
+        elif point.y() >= height - margin: edges |= Qt.Edge.BottomEdge
+        if event.type() == QEvent.Type.MouseMove:
+            cursor = Qt.CursorShape.ArrowCursor
+            if edges in (Qt.Edge.LeftEdge, Qt.Edge.RightEdge): cursor = Qt.CursorShape.SizeHorCursor
+            elif edges in (Qt.Edge.TopEdge, Qt.Edge.BottomEdge): cursor = Qt.CursorShape.SizeVerCursor
+            elif edges in (Qt.Edge.TopEdge | Qt.Edge.LeftEdge, Qt.Edge.BottomEdge | Qt.Edge.RightEdge): cursor = Qt.CursorShape.SizeFDiagCursor
+            elif edges: cursor = Qt.CursorShape.SizeBDiagCursor
+            source.setCursor(cursor)
+        elif edges and event.button() == Qt.MouseButton.LeftButton and self.windowHandle():
+            if self.windowHandle().startSystemResize(edges):
+                return True
+        return super().eventFilter(source, event)
+
+    def value(self) -> str:
+        return self.input.text().strip()
+
+
+class PatientDeleteDialog(QDialog):
+    """Подтверждение удаления пациента в визуальном стиле приложения."""
+    def __init__(self, patient_name: str, history_number: str, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setObjectName("referenceDialog")
+        self.setWindowTitle("Удалить пациента")
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setFixedSize(500, 300)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(1, 1, 1, 1)
+        outer.setSpacing(0)
+        outer.addWidget(DialogTitleBar(self, "Удалить пациента"))
+
+        body = QWidget()
+        body.setObjectName("dialogBody")
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(20, 20, 20, 20)
+        content = QFrame()
+        content.setObjectName("dialogContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(10)
+
+        eyebrow = QLabel("УДАЛЕНИЕ ИЗ ЖУРНАЛА")
+        eyebrow.setObjectName("dialogEyebrow")
+        title = QLabel("Удалить пациента?")
+        title.setObjectName("dialogTitle")
+        details = QLabel(f"Будет удалена запись № {history_number}: {patient_name}.")
+        details.setObjectName("muted")
+        details.setWordWrap(True)
+        warning = QLabel("Это действие нельзя отменить.")
+        warning.setObjectName("muted")
+        warning.setStyleSheet("color:#a13d38;")
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        cancel = QPushButton("Отмена")
+        cancel.setObjectName("outline")
+        cancel.clicked.connect(self.reject)
+        confirm = QPushButton("Удалить пациента")
+        confirm.setObjectName("danger")
+        confirm.clicked.connect(self.accept)
+        actions.addWidget(cancel)
+        actions.addWidget(confirm)
+
+        layout.addWidget(eyebrow)
+        layout.addWidget(title)
+        layout.addWidget(details)
+        layout.addWidget(warning)
+        layout.addStretch()
+        layout.addLayout(actions)
+        body_layout.addWidget(content)
+        outer.addWidget(body, 1)
+        self.update_window_mask()
+
+    def update_window_mask(self) -> None:
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), 10, 10)
+        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
+
 class ReferenceCard(QFrame):
     def __init__(self, owner: "JournalWindow", title: str, key: str, singular: str) -> None:
         super().__init__(); self.owner, self.key, self.title = owner, key, title
         self.setObjectName("card"); layout = QVBoxLayout(self); layout.setContentsMargins(18, 18, 18, 18); layout.setSpacing(10)
         label = QLabel(title); label.setObjectName("section"); layout.addWidget(label)
-        self.listbox = QListWidget(); self.listbox.setMinimumHeight(220); layout.addWidget(self.listbox)
+        self.listbox = QListWidget(); self.listbox.setMinimumHeight(220); self.listbox.setFocusPolicy(Qt.FocusPolicy.NoFocus); layout.addWidget(self.listbox)
         actions = QHBoxLayout()
         for text, slot in ((f"+ Добавить {singular}", self.add), ("Изменить", self.edit), ("Удалить", self.delete)):
             button = QPushButton(text); button.setObjectName("outline"); button.clicked.connect(slot); actions.addWidget(button)
@@ -152,17 +535,24 @@ class ReferenceCard(QFrame):
     def refresh(self) -> None:
         self.listbox.clear(); self.listbox.addItems(self.owner.store.settings[self.key])
 
+    def request_value(self, action: str, value: str = "") -> str | None:
+        dialog = ReferenceValueDialog(action, self.title, value, self.owner.store.settings["reference_dialog_size"], self)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        self.owner.store.settings["reference_dialog_size"] = [dialog.width(), dialog.height()]
+        self.owner.store.save_settings()
+        return dialog.value() if accepted else None
+
     def add(self) -> None:
-        text, ok = QInputDialog.getText(self, "Добавить", self.title)
-        if ok and text.strip() and text.strip() not in self.owner.store.settings[self.key]:
-            self.owner.store.settings[self.key].append(text.strip()); self.owner.persist_references()
+        text = self.request_value("Добавить")
+        if text and text not in self.owner.store.settings[self.key]:
+            self.owner.store.settings[self.key].append(text); self.owner.persist_references()
 
     def edit(self) -> None:
         row = self.listbox.currentRow()
         if row < 0: return
         old = self.owner.store.settings[self.key][row]
-        text, ok = QInputDialog.getText(self, "Изменить", self.title, text=old)
-        if ok and text.strip(): self.owner.store.settings[self.key][row] = text.strip(); self.owner.persist_references()
+        text = self.request_value("Изменить", old)
+        if text: self.owner.store.settings[self.key][row] = text; self.owner.persist_references()
 
     def delete(self) -> None:
         row = self.listbox.currentRow()
@@ -178,23 +568,84 @@ class JournalWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__(); self.store = DataStore(); self.page = 0; self.total = 0; self.editing_history: str | None = None
-        self.setWindowTitle("Журнал пациентов"); self.resize(1540, 900); self.setMinimumSize(1160, 720); self.setStyleSheet(QSS)
-        self.build(); self.store.connect(); self.show_patients()
+        self.setWindowTitle("Журнал пациентов"); self.setWindowFlag(Qt.WindowType.FramelessWindowHint); self.resize(1540, 900); self.setMinimumSize(1160, 720); self.setStyleSheet(QSS)
+        self.build(); self.update_window_mask(); self.store.connect(); self.show_patients()
 
     def build(self) -> None:
-        root = QWidget(); root.setObjectName("root"); self.setCentralWidget(root); shell = QHBoxLayout(root); shell.setContentsMargins(0,0,0,0); shell.setSpacing(0)
-        sidebar = QFrame(); sidebar.setObjectName("sidebar"); sidebar.setFixedWidth(232); side = QVBoxLayout(sidebar); side.setContentsMargins(14, 25, 14, 22); side.setSpacing(5)
+        root = QWidget(); root.setObjectName("root"); root.setMouseTracking(True); self.setCentralWidget(root)
+        outer = QVBoxLayout(root); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+        self.titlebar = TitleBar(self); outer.addWidget(self.titlebar)
+        shell_widget = QWidget(); shell_widget.setObjectName("shell"); shell = QHBoxLayout(shell_widget); shell.setContentsMargins(0,0,0,0); shell.setSpacing(0); outer.addWidget(shell_widget, 1)
+        sidebar = QFrame(); sidebar.setObjectName("sidebar"); sidebar.setFixedWidth(232); side = QVBoxLayout(sidebar); side.setContentsMargins(14, 18, 14, 22); side.setSpacing(5)
         brand = QLabel("ЖУРНАЛ"); brand.setStyleSheet("color:#9aa6b8;font-size:11px;font-weight:700;letter-spacing:1.4px;padding:0 10px 14px;"); side.addWidget(brand)
         self.nav_group = QButtonGroup(self); self.nav_group.setExclusive(True)
-        self.nav_patients = self.nav_button("👥  Пациенты", True, self.show_patients); side.addWidget(self.nav_patients)
-        self.nav_reports = self.nav_button("▥  Отчёты   · скоро", False, self.show_reports); side.addWidget(self.nav_reports); side.addStretch()
-        self.nav_settings = self.nav_button("⚙  Настройки", False, self.show_settings); side.addWidget(self.nav_settings); shell.addWidget(sidebar)
+        self.nav_patients = self.nav_button("Журнал", "journal.png", True, self.show_patients); side.addWidget(self.nav_patients)
+        self.nav_reports = self.nav_button("Отчёты  · скоро", "reports.png", False, self.show_reports); side.addWidget(self.nav_reports); side.addStretch()
+        self.nav_settings = self.nav_button("Настройки", "settings.png", False, self.show_settings); side.addWidget(self.nav_settings); shell.addWidget(sidebar)
         self.stack = QStackedWidget(); shell.addWidget(self.stack, 1)
         self.patient_page = self.make_patient_page(); self.settings_page = self.make_settings_page(); self.report_page = self.make_report_page()
         self.stack.addWidget(self.patient_page); self.stack.addWidget(self.settings_page); self.stack.addWidget(self.report_page)
+        for widget in self.findChildren(QWidget):
+            widget.setMouseTracking(True)
+            widget.installEventFilter(self)
 
-    def nav_button(self, text: str, checked: bool, slot) -> QPushButton:
-        button = QPushButton(text); button.setObjectName("nav"); button.setCheckable(True); button.setChecked(checked); button.clicked.connect(slot); self.nav_group.addButton(button); return button
+    def toggle_maximized(self) -> None:
+        self.showNormal() if self.isMaximized() else self.showMaximized()
+
+    def update_window_mask(self) -> None:
+        """Скругляет нативную форму окна без прозрачного Qt-холста."""
+        if self.isMaximized():
+            self.clearMask()
+            return
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), 10, 10)
+        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.update_window_mask()
+
+    def changeEvent(self, event) -> None:
+        if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "titlebar"):
+            self.titlebar.update_maximize_control(self.isMaximized())
+            self.update_window_mask()
+        super().changeEvent(event)
+
+    def eventFilter(self, source, event) -> bool:
+        """Возвращает системное изменение размера на границах frameless-окна."""
+        if self.isMaximized() or event.type() not in (QEvent.Type.MouseMove, QEvent.Type.MouseButtonPress):
+            return super().eventFilter(source, event)
+        if not hasattr(event, "globalPosition"):
+            return super().eventFilter(source, event)
+        point = self.mapFromGlobal(event.globalPosition().toPoint())
+        margin, width, height = 7, self.width(), self.height()
+        edges = Qt.Edge(0)
+        if point.x() <= margin: edges |= Qt.Edge.LeftEdge
+        elif point.x() >= width - margin: edges |= Qt.Edge.RightEdge
+        if point.y() <= margin: edges |= Qt.Edge.TopEdge
+        elif point.y() >= height - margin: edges |= Qt.Edge.BottomEdge
+        if event.type() == QEvent.Type.MouseMove:
+            cursor = Qt.CursorShape.ArrowCursor
+            if edges in (Qt.Edge.LeftEdge, Qt.Edge.RightEdge): cursor = Qt.CursorShape.SizeHorCursor
+            elif edges in (Qt.Edge.TopEdge, Qt.Edge.BottomEdge): cursor = Qt.CursorShape.SizeVerCursor
+            elif edges in (Qt.Edge.TopEdge | Qt.Edge.LeftEdge, Qt.Edge.BottomEdge | Qt.Edge.RightEdge): cursor = Qt.CursorShape.SizeFDiagCursor
+            elif edges: cursor = Qt.CursorShape.SizeBDiagCursor
+            source.setCursor(cursor)
+        elif edges and event.button() == Qt.MouseButton.LeftButton and self.windowHandle():
+            if self.windowHandle().startSystemResize(edges):
+                return True
+        return super().eventFilter(source, event)
+
+    def nav_button(self, text: str, icon_name: str, checked: bool, slot) -> QPushButton:
+        button = QPushButton(text)
+        button.setObjectName("nav")
+        button.setIcon(QIcon(str(ICON_DIR / icon_name)))
+        button.setIconSize(QSize(17, 17))
+        button.setCheckable(True)
+        button.setChecked(checked)
+        button.clicked.connect(slot)
+        self.nav_group.addButton(button)
+        return button
 
     def page_layout(self, widget: QWidget) -> QVBoxLayout:
         layout = QVBoxLayout(widget); layout.setContentsMargins(34, 28, 34, 28); layout.setSpacing(14); return layout
@@ -211,9 +662,9 @@ class JournalWindow(QMainWindow):
         self.apply_button = QPushButton("Применить"); self.apply_button.setObjectName("outline"); self.apply_button.clicked.connect(self.apply_filters); filters.addWidget(self.apply_button)
         self.reset_button = QPushButton("Сбросить"); self.reset_button.setObjectName("outline"); self.reset_button.clicked.connect(self.reset_filters); filters.addWidget(self.reset_button); filters.addStretch(); layout.addLayout(filters)
         content = QHBoxLayout(); content.setSpacing(14); table_card = QFrame(); table_card.setObjectName("card"); table_layout = QVBoxLayout(table_card); table_layout.setContentsMargins(1,1,1,8); table_layout.setSpacing(3)
-        self.table = QTableWidget(0, len(self.headers)); self.table.setHorizontalHeaderLabels(self.headers); self.table.verticalHeader().setVisible(False); self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection); self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.table.setAlternatingRowColors(False)
+        self.table = QTableWidget(0, len(self.headers)); self.table.setHorizontalHeaderLabels(self.headers); self.table.verticalHeader().setVisible(False); self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection); self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus); self.table.setAlternatingRowColors(False)
         for i, width in enumerate(self.widths): self.table.setColumnWidth(i, width)
-        self.table.horizontalHeader().setStretchLastSection(False); self.table.itemSelectionChanged.connect(self.selection_changed); table_layout.addWidget(self.table, 1)
+        table_header = self.table.horizontalHeader(); table_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive); table_header.setMinimumSectionSize(52); table_header.setStretchLastSection(False); self.table.itemSelectionChanged.connect(self.selection_changed); table_layout.addWidget(self.table, 1)
         footer = QHBoxLayout(); self.page_info = QLabel("Показано 0 из 0"); self.page_info.setObjectName("muted"); footer.addWidget(self.page_info); footer.addStretch(); self.prev = QPushButton("‹"); self.prev.setObjectName("outline"); self.prev.setFixedWidth(38); self.prev.clicked.connect(lambda: self.change_page(-1)); footer.addWidget(self.prev); self.page_num = QLabel("1"); self.page_num.setAlignment(Qt.AlignmentFlag.AlignCenter); self.page_num.setFixedWidth(38); self.page_num.setStyleSheet("background:#eaf2ff;color:#1769e0;border-radius:9px;padding:8px;font-weight:600;"); footer.addWidget(self.page_num); self.next = QPushButton("›"); self.next.setObjectName("outline"); self.next.setFixedWidth(38); self.next.clicked.connect(lambda: self.change_page(1)); footer.addWidget(self.next); table_layout.addLayout(footer); content.addWidget(table_card, 1)
         self.form_card = self.make_quick_form(); content.addWidget(self.form_card, 0); layout.addLayout(content, 1)
         return page
@@ -230,13 +681,15 @@ class JournalWindow(QMainWindow):
         text("№ истории", "history", True); text("ФИО", "name", True); text("Возраст", "age", False)
         form.addWidget(QLabel("Операция", objectName="muted")); kinds = QHBoxLayout(); self.kind_group = QButtonGroup(self); self.kind_planned = QRadioButton("Плановая"); self.kind_emergency = QRadioButton("Экстренная"); self.kind_planned.setChecked(True); self.kind_group.addButton(self.kind_planned); self.kind_group.addButton(self.kind_emergency); kinds.addWidget(self.kind_planned); kinds.addWidget(self.kind_emergency); form.addLayout(kinds); self.input_widgets += [self.kind_planned, self.kind_emergency]
         text("Дата операции", "date", True, "ГГГГ-ММ-ДД"); self.fields["date"].setText(date.today().isoformat()); text("Диагноз", "diagnosis"); combo("Вид наркоза", "anesthesia", self.store.settings["anesthesia_types"], True)
-        time_row = QHBoxLayout(); start_box = QLineEdit(); end_box = QLineEdit(); start_box.setPlaceholderText("ЧЧ:ММ"); end_box.setPlaceholderText("ЧЧ:ММ"); self.fields["start"], self.fields["end"] = start_box, end_box; self.input_widgets += [start_box, end_box]
+        time_row = QHBoxLayout(); start_box = TimeField(); end_box = TimeField(); self.fields["start"], self.fields["end"] = start_box, end_box; self.input_widgets += [start_box, end_box]
         for title, box in (("Начало", start_box), ("Окончание", end_box)):
             col = QVBoxLayout(); lab = QLabel(title); lab.setObjectName("muted"); col.addWidget(lab); col.addWidget(box); time_row.addLayout(col)
         form.addLayout(time_row); duration_label = QLabel("Длительность · рассчитывается автоматически"); duration_label.setObjectName("muted"); form.addWidget(duration_label); self.duration = QLineEdit("—"); self.duration.setReadOnly(True); form.addWidget(self.duration); start_box.textChanged.connect(self.update_duration); end_box.textChanged.connect(self.update_duration)
         text("Название операции", "procedure"); combo("Врач", "doctor", self.store.settings["doctors"]); combo("Медсестра", "nurse", self.store.settings["nurses"])
         self.save_button = QPushButton("Добавить пациента"); self.save_button.setObjectName("primary"); self.save_button.clicked.connect(self.save_patient); form.addWidget(self.save_button)
-        self.cancel_button = QPushButton("Отмена"); self.cancel_button.setObjectName("outline"); self.cancel_button.clicked.connect(self.cancel_edit); self.cancel_button.hide(); form.addWidget(self.cancel_button); form.addStretch(); scroll.setWidget(inner); outer.addWidget(scroll); return card
+        self.cancel_button = QPushButton("Отмена"); self.cancel_button.setObjectName("outline"); self.cancel_button.clicked.connect(self.cancel_edit); self.cancel_button.hide(); form.addWidget(self.cancel_button)
+        self.delete_patient_button = QPushButton("Удалить пациента"); self.delete_patient_button.setObjectName("danger"); self.delete_patient_button.clicked.connect(self.delete_patient); self.delete_patient_button.hide(); form.addWidget(self.delete_patient_button)
+        form.addStretch(); scroll.setWidget(inner); outer.addWidget(scroll); return card
 
     def make_settings_page(self) -> QWidget:
         page = QWidget(); layout = self.page_layout(page); title = QLabel("Настройки"); title.setObjectName("title"); layout.addWidget(title); subtitle = QLabel("Справочники и хранение данных"); subtitle.setObjectName("muted"); layout.addWidget(subtitle)
@@ -262,6 +715,7 @@ class JournalWindow(QMainWindow):
 
     def refresh_patient_state(self) -> None:
         available = self.store.conn is not None
+        self.titlebar.set_connection_state(available)
         self.alert.setVisible(not available)
         if not available: self.alert_text.setText("База данных недоступна. Просмотр, добавление и редактирование пациентов временно недоступны.")
         for widget in [self.table, self.filter_name, self.filter_date, self.apply_button, self.reset_button, self.save_button, self.prev, self.next, *self.input_widgets]: widget.setEnabled(available)
@@ -283,6 +737,12 @@ class JournalWindow(QMainWindow):
             where, params = self.where_clause(); conn = self.store.conn; self.total = int(conn.execute("SELECT COUNT(*) FROM patients" + where, params).fetchone()[0]); self.page = min(self.page, max(0, (self.total - 1)//PAGE_SIZE)); rows = conn.execute("SELECT * FROM patients" + where + " ORDER BY operation_date DESC, created_at DESC LIMIT ? OFFSET ?", [*params, PAGE_SIZE, self.page * PAGE_SIZE]).fetchall()
         except sqlite3.Error as exc:
             self.store.error = str(exc); self.store.close(); self.refresh_patient_state(); return
+        # После фильтрации модель таблицы пересоздаётся. Явно сбрасываем
+        # текущую ячейку вместе с выделением, иначе Qt может сохранить
+        # устаревший текущий индекс и не послать сигнал при повторном клике.
+        self.table.clearSelection()
+        self.table.setCurrentItem(None)
+        self.table.clearContents()
         self.table.setRowCount(len(rows))
         for r, row in enumerate(rows):
             values = [row["history_number"], row["full_name"], str(row["age"] or "—"), row["operation_kind"], row["operation_date"], row["diagnosis"] or "—", row["anesthesia_type"], row["anesthesia_start"] or "—", row["anesthesia_end"] or "—", self.duration_text(row["anesthesia_start"], row["anesthesia_end"]), row["procedure_name"] or "—", row["doctor"] or "—", row["nurse"] or "—"]
@@ -291,7 +751,7 @@ class JournalWindow(QMainWindow):
                 if c == 3: item.setForeground(QColor("#1769e0") if value == "Плановая" else QColor("#d84d4d"))
                 self.table.setItem(r,c,item)
             self.table.setRowHeight(r, 48)
-        first = self.page*PAGE_SIZE+1 if self.total else 0; last = min((self.page+1)*PAGE_SIZE, self.total); self.page_info.setText(f"Показано {first}–{last} из {self.total}"); self.page_num.setText(str(self.page+1)); self.prev.setEnabled(self.page>0); self.next.setEnabled(last<self.total); self.edit_button.setEnabled(False)
+        first = self.page*PAGE_SIZE+1 if self.total else 0; last = min((self.page+1)*PAGE_SIZE, self.total); self.page_info.setText(f"Показано {first}–{last} из {self.total}"); self.page_num.setText(str(self.page+1)); self.prev.setEnabled(self.page>0); self.next.setEnabled(last<self.total); self.selection_changed()
 
     def apply_filters(self) -> None: self.page = 0; self.load_patients()
     def reset_filters(self) -> None: self.filter_name.clear(); self.filter_date.clear(); self.apply_filters()
@@ -301,10 +761,20 @@ class JournalWindow(QMainWindow):
     @staticmethod
     def duration_text(start: str | None, end: str | None) -> str:
         if not start or not end: return "—"
-        try: minutes = int((datetime.strptime(end, "%H:%M") - datetime.strptime(start, "%H:%M")).total_seconds()//60)
-        except ValueError: return "Укажите ЧЧ:ММ"
+        start_time = JournalWindow.parse_time(start)
+        end_time = JournalWindow.parse_time(end)
+        if not start_time or not end_time: return "Укажите ЧЧ:ММ"
+        minutes = start_time.secsTo(end_time) // 60
         if minutes < 0: return "Проверьте время"
         return f"{minutes//60} ч {minutes%60} мин" if minutes >= 60 else f"{minutes} мин"
+
+    @staticmethod
+    def parse_time(value: str) -> QTime | None:
+        for format_string in ("HH:mm", "H:mm"):
+            parsed = QTime.fromString(value.strip(), format_string)
+            if parsed.isValid():
+                return parsed
+        return None
 
     def update_duration(self) -> None: self.duration.setText(self.duration_text(self.fields["start"].text().strip(), self.fields["end"].text().strip()))
     def field_value(self, key: str) -> str: return self.fields[key].currentText().strip() if isinstance(self.fields[key], QComboBox) else self.fields[key].text().strip()
@@ -342,12 +812,31 @@ class JournalWindow(QMainWindow):
         mapping = {"history":"history_number","name":"full_name","age":"age","date":"operation_date","diagnosis":"diagnosis","anesthesia":"anesthesia_type","start":"anesthesia_start","end":"anesthesia_end","procedure":"procedure_name","doctor":"doctor","nurse":"nurse"}
         for key,column in mapping.items():
             target=self.fields[key]; value=str(row[column] or ""); target.setCurrentText(value) if isinstance(target,QComboBox) else target.setText(value)
-        self.kind_planned.setChecked(row["operation_kind"] == "Плановая"); self.kind_emergency.setChecked(row["operation_kind"] == "Экстренная"); self.form_title.setText("Редактирование пациента"); self.save_button.setText("Сохранить изменения"); self.cancel_button.show(); self.update_duration()
+        self.kind_planned.setChecked(row["operation_kind"] == "Плановая"); self.kind_emergency.setChecked(row["operation_kind"] == "Экстренная"); self.form_title.setText("Редактирование пациента"); self.save_button.setText("Сохранить изменения"); self.cancel_button.show(); self.delete_patient_button.show(); self.update_duration()
 
     def cancel_edit(self) -> None:
         self.editing_history=None
         for key, target in self.fields.items(): target.setCurrentText("") if isinstance(target,QComboBox) else target.setText("")
-        self.fields["date"].setText(date.today().isoformat()); self.kind_planned.setChecked(True); self.form_title.setText("Быстрое добавление"); self.save_button.setText("Добавить пациента"); self.cancel_button.hide(); self.update_duration()
+        self.fields["date"].setText(date.today().isoformat()); self.kind_planned.setChecked(True); self.form_title.setText("Быстрое добавление"); self.save_button.setText("Добавить пациента"); self.cancel_button.hide(); self.delete_patient_button.hide(); self.update_duration()
+
+    def delete_patient(self) -> None:
+        if not self.store.conn or self.editing_history is None:
+            return
+        patient_name = self.fields["name"].text().strip() or "без указанного ФИО"
+        dialog = PatientDeleteDialog(patient_name, self.editing_history, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self.store.conn.execute("DELETE FROM patients WHERE history_number=?", (self.editing_history,))
+            self.store.conn.commit()
+        except sqlite3.Error as exc:
+            self.store.error = str(exc)
+            self.store.close()
+            self.refresh_patient_state()
+            return
+        self.page = 0
+        self.cancel_edit()
+        self.load_patients()
 
     def refresh_references(self) -> None:
         for card in self.reference_cards: card.refresh()
@@ -367,4 +856,10 @@ class JournalWindow(QMainWindow):
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv); window = JournalWindow(); window.show(); sys.exit(app.exec())
+    app = QApplication(sys.argv)
+    # Fusion не использует нестабильные растровые эффекты WindowsVistaStyle
+    # при наведении и фокусе, из-за которых Qt мог выводить QPainter-предупреждения.
+    app.setStyle("Fusion")
+    window = JournalWindow()
+    window.show()
+    sys.exit(app.exec())
