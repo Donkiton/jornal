@@ -22,6 +22,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name='JournalPatients',
+    icon='assets/icons/logo.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

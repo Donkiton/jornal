@@ -5,15 +5,17 @@
 from __future__ import annotations
 
 import json
+import ctypes
 import sqlite3
 import sys
+from ctypes import wintypes
 from datetime import date, datetime
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, QTime, Qt
+from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, QSize, QTime, QTimer, Qt
 from PySide6.QtGui import QColor, QIcon, QPainterPath, QRegion
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QComboBox, QDialog, QFileDialog, QFrame, QGridLayout,
+    QApplication, QButtonGroup, QComboBox, QDialog, QFrame, QGridLayout,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
     QMainWindow, QMessageBox, QPushButton, QRadioButton, QScrollArea,
     QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
@@ -22,10 +24,16 @@ from PySide6.QtWidgets import (
 
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 CONFIG_PATH, BACKUP_DIR, DEFAULT_DB = APP_DIR / "settings.json", APP_DIR / "backups", APP_DIR / "data" / "journal.db"
-ICON_DIR = APP_DIR / "assets" / "icons"
+# При сборке PyInstaller помещает добавленные данные в _internal. Настройки и
+# базу храним рядом с exe, а неизменяемые ресурсы берём из папки сборки.
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
+ICON_DIR = RESOURCE_DIR / "assets" / "icons"
+INSTANCE_LOCK_PATH = APP_DIR / ".journal.lock"
 PAGE_SIZE = 10
 DEFAULT_SETTINGS = {
     "db_path": str(DEFAULT_DB), "last_backup_week": "",
+    "window_geometry": None,
+    "window_maximized": False,
     "anesthesia_types": ["Общая эндотрахеальная", "Спинальная", "Местная", "Проводниковая", "Седация"],
     "doctors": ["Смирнов И. П.", "Соколов Д. А.", "Павлов Р. А."],
     "nurses": ["Кузнецова О. В.", "Морозова Т. С.", "Иванова Е. П."],
@@ -54,6 +62,8 @@ QFrame#card { background: #ffffff; border: 1px solid #e5e5ea; border-radius: 14p
 QLabel#title { font-size: 28px; font-weight: 700; color: #1d1d1f; letter-spacing: -0.7px; }
 QLabel#muted { color: #6e6e73; font-size: 12px; }
 QLabel#section { font-size: 14px; font-weight: 700; color: #1d1d1f; }
+QLabel#reportMetric { color: #1d1d1f; font-size: 30px; font-weight: 700; letter-spacing: -0.6px; }
+QLabel#reportMetricLabel { color: #6e6e73; font-size: 12px; }
 QPushButton { border: 0; border-radius: 8px; padding: 9px 12px; font-size: 13px; background: transparent; }
 QPushButton:hover { background: #ececf0; }
 QPushButton:pressed { background: #e0e0e5; }
@@ -79,6 +89,7 @@ QWidget#dialogBody { background: #f5f5f7; border-bottom-left-radius: 10px; borde
 QFrame#dialogContent { background: white; border: 1px solid #e5e5ea; border-radius: 14px; }
 QLabel#dialogEyebrow { color: #6e6e73; font-size: 11px; font-weight: 600; }
 QLabel#dialogTitle { color: #1d1d1f; font-size: 20px; font-weight: 700; }
+QLabel#dialogWarning { color: #d1544d; font-size: 11px; font-weight: 700; letter-spacing: 0.6px; }
 QComboBox::drop-down { border: 0; width: 25px; }
 QTableWidget { background: white; border: none; gridline-color: #f0f0f2; selection-background-color: #e8f1ff; selection-color: #1d1d1f; font-size: 12px; }
 QHeaderView::section { background: #fbfbfc; border-top: 0; border-left: 0; border-right: 1px solid #c2c6ce; border-bottom: 1px solid #d5d8de; color: #535761; font-size: 11px; font-weight: 600; padding: 11px 8px; }
@@ -100,6 +111,53 @@ QRadioButton { padding: 8px 10px; border: 1px solid #d2d2d7; border-radius: 8px;
 QRadioButton::indicator { width: 0; height: 0; }
 QRadioButton:checked { background: #e8f1ff; border-color: #8ec4ff; color: #007aff; font-weight: 600; }
 """
+
+
+class _Overlapped(ctypes.Structure):
+    _fields_ = [
+        ("internal", ctypes.c_size_t),
+        ("internal_high", ctypes.c_size_t),
+        ("offset", wintypes.DWORD),
+        ("offset_high", wintypes.DWORD),
+        ("event", wintypes.HANDLE),
+    ]
+
+
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_create_file = _kernel32.CreateFileW
+_create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+_create_file.restype = wintypes.HANDLE
+_lock_file_ex = _kernel32.LockFileEx
+_lock_file_ex.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(_Overlapped)]
+_lock_file_ex.restype = wintypes.BOOL
+_unlock_file_ex = _kernel32.UnlockFileEx
+_unlock_file_ex.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(_Overlapped)]
+_unlock_file_ex.restype = wintypes.BOOL
+_close_handle = _kernel32.CloseHandle
+_close_handle.argtypes = [wintypes.HANDLE]
+_close_handle.restype = wintypes.BOOL
+_delete_file = _kernel32.DeleteFileW
+_delete_file.argtypes = [wintypes.LPCWSTR]
+_delete_file.restype = wintypes.BOOL
+
+_GENERIC_READ, _GENERIC_WRITE = 0x80000000, 0x40000000
+_FILE_SHARE_READ, _FILE_SHARE_WRITE, _FILE_SHARE_DELETE = 0x1, 0x2, 0x4
+_OPEN_ALWAYS, _FILE_ATTRIBUTE_NORMAL = 4, 0x80
+_LOCKFILE_FAIL_IMMEDIATELY, _LOCKFILE_EXCLUSIVE_LOCK = 0x1, 0x2
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+def parse_clock_time(value: str) -> QTime | None:
+    """Разбирает время в формате ЧЧ:ММ или компактном ЧЧММ."""
+    normalized = value.strip()
+    if normalized.isdigit() and len(normalized) in (3, 4):
+        normalized = normalized.zfill(4)
+        normalized = f"{normalized[:2]}:{normalized[2:]}"
+    for format_string in ("HH:mm", "H:mm"):
+        parsed = QTime.fromString(normalized, format_string)
+        if parsed.isValid():
+            return parsed
+    return None
 
 
 class TitleBar(QFrame):
@@ -138,12 +196,14 @@ class TitleBar(QFrame):
         control_layout = QHBoxLayout(controls)
         control_layout.setContentsMargins(0, 0, 0, 0)
         control_layout.setSpacing(8)
-        self.maximize = self.control("Развернуть окно", self.window.toggle_maximized, "maximizeControl")
-        minimize = self.control("Свернуть окно", self.window.showMinimized, "minimizeControl")
+        # Цвета и расположение оставлены как в макете: зелёная кнопка слева,
+        # оранжевая рядом с ней. Меняем только назначение действий.
+        minimize = self.control("Свернуть окно", self.window.showMinimized, "maximizeControl")
+        self.maximize = self.control("Развернуть окно", self.window.toggle_maximized, "minimizeControl")
         close = self.control("Закрыть окно", self.window.close, "closeControl")
         control_layout.addStretch()
-        control_layout.addWidget(self.maximize)
         control_layout.addWidget(minimize)
+        control_layout.addWidget(self.maximize)
         control_layout.addWidget(close)
         layout.addWidget(controls)
 
@@ -203,14 +263,7 @@ class TimeField(QLineEdit):
         self.editingFinished.connect(self.normalize)
 
     def parsed_time(self) -> QTime | None:
-        value = self.text().strip()
-        if not value:
-            return None
-        for format_string in ("HH:mm", "H:mm"):
-            parsed = QTime.fromString(value, format_string)
-            if parsed.isValid():
-                return parsed
-        return None
+        return parse_clock_time(self.text())
 
     def clear_invalid_state(self) -> None:
         self.setProperty("invalidTime", False)
@@ -234,6 +287,11 @@ class TimeField(QLineEdit):
 class DataStore:
     def __init__(self) -> None:
         self.settings = self.load_settings()
+        # База всегда поставляется и хранится рядом с приложением. Сбрасываем
+        # абсолютные пути из старых настроек, созданных на другом компьютере.
+        if self.settings.get("db_path") != str(DEFAULT_DB):
+            self.settings["db_path"] = str(DEFAULT_DB)
+            self.save_settings()
         self.conn: sqlite3.Connection | None = None
         self.error = ""
 
@@ -255,7 +313,7 @@ class DataStore:
 
     @property
     def db_path(self) -> Path:
-        return Path(self.settings["db_path"]).expanduser()
+        return DEFAULT_DB
 
     def connect(self) -> bool:
         self.close()
@@ -302,6 +360,43 @@ class DataStore:
                 self.conn.backup(backup)
         self.settings["last_backup_week"] = week
         self.save_settings()
+
+
+class ProgramInstanceLock:
+    """Эксклюзивная блокировка для общей папки приложения в сети."""
+    def __init__(self) -> None:
+        self.handle: int | None = None
+        self.overlapped = _Overlapped()
+
+    def acquire(self) -> bool:
+        handle = _create_file(
+            str(INSTANCE_LOCK_PATH),
+            _GENERIC_READ | _GENERIC_WRITE,
+            _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+            None,
+            _OPEN_ALWAYS,
+            _FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        if handle == _INVALID_HANDLE_VALUE:
+            return False
+        if not _lock_file_ex(handle, _LOCKFILE_EXCLUSIVE_LOCK | _LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, ctypes.byref(self.overlapped)):
+            _close_handle(handle)
+            return False
+        self.handle = handle
+        return True
+
+    def release(self) -> None:
+        if self.handle is None:
+            return
+        try:
+            # Открываем файл с FILE_SHARE_DELETE: DeleteFileW помечает его к
+            # удалению, но не даёт новой копии открыть старое имя до close.
+            _delete_file(str(INSTANCE_LOCK_PATH))
+        finally:
+            _unlock_file_ex(self.handle, 0, 1, 0, ctypes.byref(self.overlapped))
+            _close_handle(self.handle)
+            self.handle = None
 
 
 class DialogTitleBar(QFrame):
@@ -443,12 +538,14 @@ class ReferenceValueDialog(QDialog):
         if point.y() <= margin: edges |= Qt.Edge.TopEdge
         elif point.y() >= height - margin: edges |= Qt.Edge.BottomEdge
         if event.type() == QEvent.Type.MouseMove:
-            cursor = Qt.CursorShape.ArrowCursor
             if edges in (Qt.Edge.LeftEdge, Qt.Edge.RightEdge): cursor = Qt.CursorShape.SizeHorCursor
             elif edges in (Qt.Edge.TopEdge, Qt.Edge.BottomEdge): cursor = Qt.CursorShape.SizeVerCursor
             elif edges in (Qt.Edge.TopEdge | Qt.Edge.LeftEdge, Qt.Edge.BottomEdge | Qt.Edge.RightEdge): cursor = Qt.CursorShape.SizeFDiagCursor
             elif edges: cursor = Qt.CursorShape.SizeBDiagCursor
-            source.setCursor(cursor)
+            else:
+                self.unsetCursor()
+                return super().eventFilter(source, event)
+            self.setCursor(cursor)
         elif edges and event.button() == Qt.MouseButton.LeftButton and self.windowHandle():
             if self.windowHandle().startSystemResize(edges):
                 return True
@@ -520,6 +617,61 @@ class PatientDeleteDialog(QDialog):
         self.setMask(QRegion(path.toFillPolygon().toPolygon()))
 
 
+class ValidationErrorDialog(QDialog):
+    """Неблокирующее по стилю, но модальное уведомление об ошибке ввода."""
+    def __init__(self, title: str, message: str, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setObjectName("referenceDialog")
+        self.setWindowTitle(title)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setFixedSize(500, 280)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(1, 1, 1, 1)
+        outer.setSpacing(0)
+        outer.addWidget(DialogTitleBar(self, title))
+
+        body = QWidget()
+        body.setObjectName("dialogBody")
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(20, 20, 20, 20)
+        content = QFrame()
+        content.setObjectName("dialogContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(10)
+
+        eyebrow = QLabel("ТРЕБУЕТСЯ ВНИМАНИЕ")
+        eyebrow.setObjectName("dialogWarning")
+        heading = QLabel(title)
+        heading.setObjectName("dialogTitle")
+        details = QLabel(message)
+        details.setObjectName("muted")
+        details.setWordWrap(True)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        acknowledge = QPushButton("Понятно")
+        acknowledge.setObjectName("primary")
+        acknowledge.clicked.connect(self.accept)
+        actions.addWidget(acknowledge)
+
+        layout.addWidget(eyebrow)
+        layout.addWidget(heading)
+        layout.addWidget(details)
+        layout.addStretch()
+        layout.addLayout(actions)
+        body_layout.addWidget(content)
+        outer.addWidget(body, 1)
+        self.update_window_mask()
+        acknowledge.setFocus()
+
+    def update_window_mask(self) -> None:
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), 10, 10)
+        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
+
 class ReferenceCard(QFrame):
     def __init__(self, owner: "JournalWindow", title: str, key: str, singular: str) -> None:
         super().__init__(); self.owner, self.key, self.title = owner, key, title
@@ -568,8 +720,10 @@ class JournalWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__(); self.store = DataStore(); self.page = 0; self.total = 0; self.editing_history: str | None = None
-        self.setWindowTitle("Журнал пациентов"); self.setWindowFlag(Qt.WindowType.FramelessWindowHint); self.resize(1540, 900); self.setMinimumSize(1160, 720); self.setStyleSheet(QSS)
+        self.setWindowTitle("Журнал пациентов"); self.setWindowIcon(QIcon(str(ICON_DIR / "logo.png"))); self.setWindowFlag(Qt.WindowType.FramelessWindowHint); self.resize(1540, 900); self.setMinimumSize(1160, 720); self.setStyleSheet(QSS)
+        self.restore_window_geometry()
         self.build(); self.update_window_mask(); self.store.connect(); self.show_patients()
+        QTimer.singleShot(0, self.restore_maximized_state)
 
     def build(self) -> None:
         root = QWidget(); root.setObjectName("root"); root.setMouseTracking(True); self.setCentralWidget(root)
@@ -580,7 +734,7 @@ class JournalWindow(QMainWindow):
         brand = QLabel("ЖУРНАЛ"); brand.setStyleSheet("color:#9aa6b8;font-size:11px;font-weight:700;letter-spacing:1.4px;padding:0 10px 14px;"); side.addWidget(brand)
         self.nav_group = QButtonGroup(self); self.nav_group.setExclusive(True)
         self.nav_patients = self.nav_button("Журнал", "journal.png", True, self.show_patients); side.addWidget(self.nav_patients)
-        self.nav_reports = self.nav_button("Отчёты  · скоро", "reports.png", False, self.show_reports); side.addWidget(self.nav_reports); side.addStretch()
+        self.nav_reports = self.nav_button("Отчёты", "reports.png", False, self.show_reports); side.addWidget(self.nav_reports); side.addStretch()
         self.nav_settings = self.nav_button("Настройки", "settings.png", False, self.show_settings); side.addWidget(self.nav_settings); shell.addWidget(sidebar)
         self.stack = QStackedWidget(); shell.addWidget(self.stack, 1)
         self.patient_page = self.make_patient_page(); self.settings_page = self.make_settings_page(); self.report_page = self.make_report_page()
@@ -605,6 +759,35 @@ class JournalWindow(QMainWindow):
         super().resizeEvent(event)
         self.update_window_mask()
 
+    def restore_window_geometry(self) -> None:
+        geometry = self.store.settings.get("window_geometry")
+        if not (isinstance(geometry, list) and len(geometry) == 4 and all(isinstance(value, int) for value in geometry)):
+            return
+        x, y, width, height = geometry
+        if width < self.minimumWidth() or height < self.minimumHeight():
+            return
+        saved_rect = QRect(x, y, width, height)
+        if any(screen.availableGeometry().intersects(saved_rect) for screen in QApplication.screens()):
+            self.setGeometry(saved_rect)
+
+    def save_window_geometry(self) -> None:
+        is_maximized = self.isMaximized()
+        rect = self.normalGeometry() if is_maximized else self.geometry()
+        self.store.settings["window_geometry"] = [rect.x(), rect.y(), rect.width(), rect.height()]
+        self.store.settings["window_maximized"] = is_maximized
+        try:
+            self.store.save_settings()
+        except OSError:
+            pass
+
+    def restore_maximized_state(self) -> None:
+        if self.store.settings.get("window_maximized") is True:
+            self.showMaximized()
+
+    def closeEvent(self, event) -> None:
+        self.save_window_geometry()
+        super().closeEvent(event)
+
     def changeEvent(self, event) -> None:
         if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "titlebar"):
             self.titlebar.update_maximize_control(self.isMaximized())
@@ -625,12 +808,14 @@ class JournalWindow(QMainWindow):
         if point.y() <= margin: edges |= Qt.Edge.TopEdge
         elif point.y() >= height - margin: edges |= Qt.Edge.BottomEdge
         if event.type() == QEvent.Type.MouseMove:
-            cursor = Qt.CursorShape.ArrowCursor
             if edges in (Qt.Edge.LeftEdge, Qt.Edge.RightEdge): cursor = Qt.CursorShape.SizeHorCursor
             elif edges in (Qt.Edge.TopEdge, Qt.Edge.BottomEdge): cursor = Qt.CursorShape.SizeVerCursor
             elif edges in (Qt.Edge.TopEdge | Qt.Edge.LeftEdge, Qt.Edge.BottomEdge | Qt.Edge.RightEdge): cursor = Qt.CursorShape.SizeFDiagCursor
             elif edges: cursor = Qt.CursorShape.SizeBDiagCursor
-            source.setCursor(cursor)
+            else:
+                self.unsetCursor()
+                return super().eventFilter(source, event)
+            self.setCursor(cursor)
         elif edges and event.button() == Qt.MouseButton.LeftButton and self.windowHandle():
             if self.windowHandle().startSystemResize(edges):
                 return True
@@ -697,10 +882,49 @@ class JournalWindow(QMainWindow):
         for card in self.reference_cards: cards.addWidget(card, 1)
         layout.addLayout(cards)
         storage = QFrame(); storage.setObjectName("card"); grid = QGridLayout(storage); grid.setContentsMargins(18,18,18,18); grid.setSpacing(9); label = QLabel("Хранение данных"); label.setObjectName("section"); grid.addWidget(label, 0, 0, 1, 3); grid.addWidget(QLabel("Путь к базе данных", objectName="muted"), 1,0,1,3)
-        self.path_field = QLineEdit(); grid.addWidget(self.path_field, 2,0); choose = QPushButton("Выбрать файл"); choose.setObjectName("outline"); choose.clicked.connect(self.choose_path); grid.addWidget(choose,2,1); save = QPushButton("Сохранить путь"); save.setObjectName("primary"); save.clicked.connect(self.save_path); grid.addWidget(save,2,2); self.connection_status = QLabel(); self.connection_status.setObjectName("muted"); grid.addWidget(self.connection_status, 3,0,1,3); layout.addWidget(storage); layout.addStretch(); return page
+        self.path_field = QLineEdit(); self.path_field.setReadOnly(True); grid.addWidget(self.path_field, 2,0,1,3); note = QLabel("База всегда хранится в папке data рядом с программой."); note.setObjectName("muted"); grid.addWidget(note, 3,0,1,3); self.connection_status = QLabel(); self.connection_status.setObjectName("muted"); grid.addWidget(self.connection_status, 4,0,1,3); layout.addWidget(storage); layout.addStretch(); return page
 
     def make_report_page(self) -> QWidget:
-        page = QWidget(); layout = self.page_layout(page); label = QLabel("Отчёты"); label.setObjectName("title"); layout.addWidget(label); text = QLabel("Раздел находится в разработке."); text.setObjectName("muted"); layout.addWidget(text); layout.addStretch(); return page
+        page = QWidget(); layout = self.page_layout(page)
+        title = QLabel("Статистический отчёт"); title.setObjectName("title"); layout.addWidget(title)
+        subtitle = QLabel("Количество операций, видов наркоза и участников за выбранный период"); subtitle.setObjectName("muted"); layout.addWidget(subtitle)
+
+        filters = QFrame(); filters.setObjectName("card"); filter_layout = QHBoxLayout(filters); filter_layout.setContentsMargins(18, 14, 18, 14); filter_layout.setSpacing(9)
+        filter_layout.addWidget(QLabel("Период", objectName="section")); filter_layout.addSpacing(8)
+        filter_layout.addWidget(QLabel("с", objectName="muted")); self.report_date_from = QLineEdit(); self.report_date_from.setPlaceholderText("ГГГГ-ММ-ДД"); self.report_date_from.setFixedWidth(130); filter_layout.addWidget(self.report_date_from)
+        filter_layout.addWidget(QLabel("по", objectName="muted")); self.report_date_to = QLineEdit(); self.report_date_to.setPlaceholderText("ГГГГ-ММ-ДД"); self.report_date_to.setFixedWidth(130); filter_layout.addWidget(self.report_date_to)
+        apply = QPushButton("Сформировать"); apply.setObjectName("primary"); apply.clicked.connect(self.refresh_report); filter_layout.addWidget(apply)
+        reset = QPushButton("За всё время"); reset.setObjectName("outline"); reset.clicked.connect(self.reset_report_filters); filter_layout.addWidget(reset); filter_layout.addStretch(); layout.addWidget(filters)
+
+        metrics = QHBoxLayout(); metrics.setSpacing(14)
+        self.report_total = self.make_report_metric("Всего операций", metrics)
+        self.report_planned = self.make_report_metric("Плановых", metrics)
+        self.report_emergency = self.make_report_metric("Экстренных", metrics)
+        layout.addLayout(metrics)
+
+        tables = QHBoxLayout(); tables.setSpacing(14)
+        anesthesia_card, self.report_anesthesia_table = self.make_report_table("Виды наркоза", "Вид наркоза")
+        doctor_card, self.report_doctor_table = self.make_report_table("Врачи", "Врач")
+        nurse_card, self.report_nurse_table = self.make_report_table("Медсёстры", "Медсестра")
+        tables.addWidget(anesthesia_card, 1); tables.addWidget(doctor_card, 1); tables.addWidget(nurse_card, 1); layout.addLayout(tables, 1)
+        self.report_status = QLabel(); self.report_status.setObjectName("muted"); layout.addWidget(self.report_status)
+        return page
+
+    @staticmethod
+    def make_report_metric(label_text: str, parent_layout: QHBoxLayout) -> QLabel:
+        card = QFrame(); card.setObjectName("card"); card_layout = QVBoxLayout(card); card_layout.setContentsMargins(18, 14, 18, 14); card_layout.setSpacing(2)
+        value = QLabel("0"); value.setObjectName("reportMetric"); caption = QLabel(label_text); caption.setObjectName("reportMetricLabel")
+        card_layout.addWidget(value); card_layout.addWidget(caption); parent_layout.addWidget(card, 1)
+        return value
+
+    @staticmethod
+    def make_report_table(title_text: str, first_column: str) -> tuple[QFrame, QTableWidget]:
+        card = QFrame(); card.setObjectName("card"); layout = QVBoxLayout(card); layout.setContentsMargins(1, 1, 1, 10); layout.setSpacing(3)
+        title = QLabel(title_text); title.setObjectName("section"); title.setContentsMargins(16, 14, 16, 5); layout.addWidget(title)
+        table = QTableWidget(0, 3); table.setHorizontalHeaderLabels([first_column, "Кол-во", "Доля"]); table.verticalHeader().setVisible(False); table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); table.setSelectionMode(QTableWidget.SelectionMode.NoSelection); table.setFocusPolicy(Qt.FocusPolicy.NoFocus); table.setShowGrid(False)
+        header = table.horizontalHeader(); header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch); header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents); header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(table, 1)
+        return card, table
 
     def select_page(self, index: int, button: QPushButton) -> None:
         self.stack.setCurrentIndex(index); button.setChecked(True)
@@ -711,7 +935,65 @@ class JournalWindow(QMainWindow):
     def show_settings(self) -> None:
         self.select_page(1, self.nav_settings); self.path_field.setText(self.store.settings["db_path"]); self.refresh_references(); self.update_connection_status()
 
-    def show_reports(self) -> None: self.select_page(2, self.nav_reports)
+    def show_reports(self) -> None:
+        self.select_page(2, self.nav_reports)
+        self.refresh_report()
+
+    def report_where_clause(self) -> tuple[str, list[str]]:
+        clauses, params = [], []
+        for field, operator in ((self.report_date_from, ">="), (self.report_date_to, "<=")):
+            value = field.text().strip()
+            if not value:
+                continue
+            datetime.strptime(value, "%Y-%m-%d")
+            clauses.append(f"operation_date {operator} ?")
+            params.append(value)
+        return (" WHERE " + " AND ".join(clauses) if clauses else ""), params
+
+    def reset_report_filters(self) -> None:
+        self.report_date_from.clear(); self.report_date_to.clear(); self.refresh_report()
+
+    @staticmethod
+    def fill_report_table(table: QTableWidget, rows, total: int) -> None:
+        table.setRowCount(0)
+        for index, row in enumerate(rows):
+            count = int(row["count"])
+            table.insertRow(index)
+            values = [str(row["name"]), str(count), f"{count / total * 100:.1f}%" if total else "0%"]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                table.setItem(index, column, item)
+            table.setRowHeight(index, 40)
+
+    def refresh_report(self) -> None:
+        if not self.store.conn:
+            self.report_total.setText("—"); self.report_planned.setText("—"); self.report_emergency.setText("—")
+            for table in (self.report_anesthesia_table, self.report_doctor_table, self.report_nurse_table): table.setRowCount(0)
+            self.report_status.setText("База данных недоступна.")
+            return
+        try:
+            where, params = self.report_where_clause()
+        except ValueError:
+            self.show_validation_error("Период отчёта", "Используйте для дат формат ГГГГ-ММ-ДД.")
+            return
+        try:
+            connection = self.store.conn
+            total = int(connection.execute("SELECT COUNT(*) FROM patients" + where, params).fetchone()[0])
+            planned = int(connection.execute("SELECT COUNT(*) FROM patients" + where + (" AND " if where else " WHERE ") + "operation_kind='Плановая'", params).fetchone()[0])
+            emergency = int(connection.execute("SELECT COUNT(*) FROM patients" + where + (" AND " if where else " WHERE ") + "operation_kind='Экстренная'", params).fetchone()[0])
+            anesthesia = connection.execute("SELECT COALESCE(NULLIF(TRIM(anesthesia_type),''),'Не указан') AS name, COUNT(*) AS count FROM patients" + where + " GROUP BY name ORDER BY count DESC, name", params).fetchall()
+            doctors = connection.execute("SELECT COALESCE(NULLIF(TRIM(doctor),''),'Не указан') AS name, COUNT(*) AS count FROM patients" + where + " GROUP BY name ORDER BY count DESC, name", params).fetchall()
+            nurses = connection.execute("SELECT COALESCE(NULLIF(TRIM(nurse),''),'Не указана') AS name, COUNT(*) AS count FROM patients" + where + " GROUP BY name ORDER BY count DESC, name", params).fetchall()
+        except sqlite3.Error as exc:
+            self.store.error = str(exc); self.store.close(); self.refresh_patient_state(); return
+        self.report_total.setText(str(total)); self.report_planned.setText(str(planned)); self.report_emergency.setText(str(emergency))
+        self.fill_report_table(self.report_anesthesia_table, anesthesia, total)
+        self.fill_report_table(self.report_doctor_table, doctors, total)
+        self.fill_report_table(self.report_nurse_table, nurses, total)
+        period = "за всё время" if not params else "за выбранный период"
+        self.report_status.setText(f"Сформировано {period}. Всего записей: {total}.")
 
     def refresh_patient_state(self) -> None:
         available = self.store.conn is not None
@@ -770,11 +1052,7 @@ class JournalWindow(QMainWindow):
 
     @staticmethod
     def parse_time(value: str) -> QTime | None:
-        for format_string in ("HH:mm", "H:mm"):
-            parsed = QTime.fromString(value.strip(), format_string)
-            if parsed.isValid():
-                return parsed
-        return None
+        return parse_clock_time(value)
 
     def update_duration(self) -> None: self.duration.setText(self.duration_text(self.fields["start"].text().strip(), self.fields["end"].text().strip()))
     def field_value(self, key: str) -> str: return self.fields[key].currentText().strip() if isinstance(self.fields[key], QComboBox) else self.fields[key].text().strip()
@@ -782,13 +1060,24 @@ class JournalWindow(QMainWindow):
     def form_data(self) -> dict[str,str]:
         return {key:self.field_value(key) for key in self.fields} | {"kind":"Плановая" if self.kind_planned.isChecked() else "Экстренная"}
 
+    def show_validation_error(self, title: str, message: str) -> None:
+        ValidationErrorDialog(title, message, self).exec()
+
     def validate(self, data: dict[str,str]) -> bool:
         missing = [label for key,label in (("history","№ истории"),("name","ФИО"),("date","Дата операции"),("anesthesia","Вид наркоза")) if not data[key]]
-        if missing: QMessageBox.warning(self,"Не заполнены поля","Обязательные поля: " + ", ".join(missing)); return False
+        if missing:
+            self.show_validation_error("Не заполнены поля", "Обязательные поля: " + ", ".join(missing))
+            return False
         try: datetime.strptime(data["date"], "%Y-%m-%d")
-        except ValueError: QMessageBox.warning(self,"Дата операции","Используйте формат ГГГГ-ММ-ДД."); return False
-        if data["age"] and (not data["age"].isdigit() or not 0 <= int(data["age"]) <= 130): QMessageBox.warning(self,"Возраст","Возраст должен быть числом от 0 до 130."); return False
-        if self.duration_text(data["start"], data["end"]) in ("Укажите ЧЧ:ММ","Проверьте время"): QMessageBox.warning(self,"Время наркоза","Проверьте начало и окончание в формате ЧЧ:ММ."); return False
+        except ValueError:
+            self.show_validation_error("Дата операции", "Используйте формат ГГГГ-ММ-ДД.")
+            return False
+        if data["age"] and (not data["age"].isdigit() or not 0 <= int(data["age"]) <= 130):
+            self.show_validation_error("Возраст", "Возраст должен быть числом от 0 до 130.")
+            return False
+        if self.duration_text(data["start"], data["end"]) in ("Укажите ЧЧ:ММ","Проверьте время"):
+            self.show_validation_error("Время наркоза", "Проверьте начало и окончание в формате ЧЧ:ММ.")
+            return False
         return True
 
     def save_patient(self) -> None:
@@ -800,7 +1089,9 @@ class JournalWindow(QMainWindow):
             if self.editing_history is None: self.store.conn.execute("INSERT INTO patients(history_number,full_name,age,operation_kind,operation_date,diagnosis,anesthesia_type,anesthesia_start,anesthesia_end,procedure_name,doctor,nurse) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", vals)
             else: self.store.conn.execute("UPDATE patients SET history_number=?,full_name=?,age=?,operation_kind=?,operation_date=?,diagnosis=?,anesthesia_type=?,anesthesia_start=?,anesthesia_end=?,procedure_name=?,doctor=?,nurse=?,updated_at=CURRENT_TIMESTAMP WHERE history_number=?", (*vals, self.editing_history))
             self.store.conn.commit()
-        except sqlite3.IntegrityError: QMessageBox.warning(self,"Не удалось сохранить","Запись с таким № истории уже существует."); return
+        except sqlite3.IntegrityError:
+            self.show_validation_error("Не удалось сохранить", "Запись с таким № истории уже существует.")
+            return
         except sqlite3.Error as exc: self.store.error=str(exc); self.store.close(); self.refresh_patient_state(); return
         self.cancel_edit(); self.load_patients()
 
@@ -844,15 +1135,9 @@ class JournalWindow(QMainWindow):
             box = self.fields[key]; value=box.currentText(); box.clear(); box.addItems(self.store.settings[source]); box.setCurrentText(value)
 
     def persist_references(self) -> None: self.store.save_settings(); self.refresh_references()
-    def choose_path(self) -> None:
-        path,_=QFileDialog.getSaveFileName(self,"Выберите файл базы",str(self.store.db_path),"SQLite (*.db);;Все файлы (*.*)")
-        if path: self.path_field.setText(path)
-    def save_path(self) -> None:
-        if not self.path_field.text().strip(): return
-        self.store.settings["db_path"] = self.path_field.text().strip(); self.store.save_settings(); self.store.connect(); self.refresh_patient_state(); self.update_connection_status()
     def update_connection_status(self) -> None:
-        if self.store.conn: self.connection_status.setText("База доступна. Выбранный путь сохранён рядом с программой."); self.connection_status.setStyleSheet("color:#16835a;")
-        else: self.connection_status.setText("База недоступна. Можно изменить путь и повторить подключение."); self.connection_status.setStyleSheet("color:#b05600;")
+        if self.store.conn: self.connection_status.setText("База доступна и хранится рядом с программой."); self.connection_status.setStyleSheet("color:#16835a;")
+        else: self.connection_status.setText("База недоступна. Проверьте доступ к папке data рядом с программой."); self.connection_status.setStyleSheet("color:#b05600;")
 
 
 if __name__ == "__main__":
@@ -860,6 +1145,16 @@ if __name__ == "__main__":
     # Fusion не использует нестабильные растровые эффекты WindowsVistaStyle
     # при наведении и фокусе, из-за которых Qt мог выводить QPainter-предупреждения.
     app.setStyle("Fusion")
+    app.setWindowIcon(QIcon(str(ICON_DIR / "logo.png")))
+    instance_lock = ProgramInstanceLock()
+    if not instance_lock.acquire():
+        ValidationErrorDialog(
+            "Программа уже открыта",
+            "Журнал уже используется на другом компьютере. Закройте его там, прежде чем продолжить работу здесь.",
+            None,
+        ).exec()
+        sys.exit(0)
+    app.aboutToQuit.connect(instance_lock.release)
     window = JournalWindow()
     window.show()
     sys.exit(app.exec())
