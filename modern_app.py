@@ -4,36 +4,58 @@
 """
 from __future__ import annotations
 
+import argparse
 import json
 import ctypes
+import os
+import shutil
 import sqlite3
+import subprocess
 import sys
+import time
 from ctypes import wintypes
 from datetime import date, datetime
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, QSize, QTime, QTimer, Qt
+PROCESS_STARTED_AT = time.perf_counter()
+
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, QSize, QThread, QTime, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QPainterPath, QPixmap, QRegion
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QComboBox, QDialog, QFrame, QGridLayout,
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QGridLayout,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
-    QMainWindow, QMessageBox, QPushButton, QRadioButton, QScrollArea, QSplashScreen,
+    QMainWindow, QMessageBox, QProgressBar, QPushButton, QRadioButton, QScrollArea, QSplashScreen,
     QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from app_version import APP_VERSION, DATABASE_SCHEMA_VERSION
+from update_system import ReleaseInfo, apply_staged_update, find_newer_release, prepare_release
 
-APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-CONFIG_PATH, BACKUP_DIR, DEFAULT_DB = APP_DIR / "settings.json", APP_DIR / "backups", APP_DIR / "data" / "journal.db"
+
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+APP_DIR = Path(sys.executable).resolve().parent if IS_FROZEN else Path(__file__).resolve().parent
+LOCAL_STATE_DIR = (
+    Path(os.environ.get("LOCALAPPDATA", str(APP_DIR))) / "JornalPatients"
+    if IS_FROZEN else APP_DIR
+)
+LEGACY_CONFIG_PATH = APP_DIR / "settings.json"
+LOCAL_LEGACY_SETTINGS_PATH = LOCAL_STATE_DIR / "settings.json"
+LOCAL_CONNECTION_PATH = LOCAL_STATE_DIR / "connection.json"
+SHARED_SETTINGS_NAME = "settings.json"
 # При сборке PyInstaller помещает добавленные данные в _internal. Настройки и
-# базу храним рядом с exe, а неизменяемые ресурсы берём из папки сборки.
+# диагностические файлы храним в локальном профиле, а неизменяемые ресурсы
+# берём из папки сборки.
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
 ICON_DIR = RESOURCE_DIR / "assets" / "icons"
-INSTANCE_LOCK_PATH = APP_DIR / ".journal.lock"
+LOG_DIR = LOCAL_STATE_DIR / "logs"
+STARTUP_LOG_PATH = LOG_DIR / "startup.log"
+UPDATE_CACHE_DIR = LOCAL_STATE_DIR / "updates"
 PAGE_SIZE = 10
 DEFAULT_SETTINGS = {
-    "db_path": str(DEFAULT_DB), "last_backup_week": "",
+    "database_root": "", "last_backup_week": "",
     "window_geometry": None,
     "window_maximized": False,
+    "startup_logging": False,
     "anesthesia_types": ["Общая эндотрахеальная", "Спинальная", "Местная", "Проводниковая", "Седация"],
     "doctors": ["Смирнов И. П.", "Соколов Д. А.", "Павлов Р. А."],
     "nurses": ["Кузнецова О. В.", "Морозова Т. С.", "Иванова Е. П."],
@@ -110,6 +132,8 @@ QListWidget::item:selected { background: #e8f1ff; color: #007aff; border-radius:
 QRadioButton { padding: 8px 10px; border: 1px solid #d2d2d7; border-radius: 8px; background: white; }
 QRadioButton::indicator { width: 0; height: 0; }
 QRadioButton:checked { background: #e8f1ff; border-color: #8ec4ff; color: #007aff; font-weight: 600; }
+QProgressBar { background: #e9e9ed; border: 0; border-radius: 5px; min-height: 10px; max-height: 10px; color: transparent; }
+QProgressBar::chunk { background: #007aff; border-radius: 5px; }
 """
 
 
@@ -147,6 +171,84 @@ _LOCKFILE_FAIL_IMMEDIATELY, _LOCKFILE_EXCLUSIVE_LOCK = 0x1, 0x2
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 
+def migrate_legacy_settings() -> None:
+    """Сохраняет совместимость с настройками сборок до версии 1.0.1."""
+    try:
+        LOCAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if (
+            LOCAL_LEGACY_SETTINGS_PATH != LEGACY_CONFIG_PATH
+            and LEGACY_CONFIG_PATH.is_file()
+            and not LOCAL_LEGACY_SETTINGS_PATH.exists()
+        ):
+            shutil.copy2(LEGACY_CONFIG_PATH, LOCAL_LEGACY_SETTINGS_PATH)
+        if not LOCAL_CONNECTION_PATH.exists():
+            for candidate in (LOCAL_LEGACY_SETTINGS_PATH, LEGACY_CONFIG_PATH):
+                source = read_json_object(candidate)
+                database_root = source.get("database_root")
+                if isinstance(database_root, str) and database_root.strip():
+                    write_json_atomic(
+                        LOCAL_CONNECTION_PATH,
+                        {"database_root": str(normalize_database_root(database_root))},
+                    )
+                    break
+    except OSError:
+        # Ошибка миграции будет корректно обработана при сохранении настроек.
+        pass
+
+
+def read_json_object(path: Path) -> dict:
+    try:
+        source = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return source if isinstance(source, dict) else {}
+
+
+def write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temporary_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary_path, path)
+
+
+def load_local_database_root() -> Path | None:
+    for candidate in (
+        LOCAL_CONNECTION_PATH,
+        LOCAL_LEGACY_SETTINGS_PATH,
+        LEGACY_CONFIG_PATH,
+    ):
+        source = read_json_object(candidate)
+        database_root = source.get("database_root")
+        if isinstance(database_root, str) and database_root.strip():
+            return normalize_database_root(database_root)
+    return None
+
+
+def shared_settings_path(root: Path) -> Path:
+    return root / SHARED_SETTINGS_NAME
+
+
+def archive_local_legacy_settings() -> None:
+    """Убирает устаревший локальный settings.json, не удаляя его безвозвратно."""
+    if not LOCAL_LEGACY_SETTINGS_PATH.is_file():
+        return
+    backup_path = LOCAL_STATE_DIR / "settings.local-backup.json"
+    if not backup_path.exists():
+        LOCAL_LEGACY_SETTINGS_PATH.replace(backup_path)
+
+
+def normalize_database_root(value: str | Path) -> Path:
+    """Принимает прямые и обратные разделители, сохраняя UNC-префикс."""
+    raw = str(value).strip().strip('"')
+    if raw.startswith("//"):
+        raw = "\\\\" + raw[2:]
+    raw = raw.replace("/", "\\")
+    return Path(os.path.normpath(raw)).expanduser()
+
+
 def parse_clock_time(value: str) -> QTime | None:
     """Разбирает время в формате ЧЧ:ММ или компактном ЧЧММ."""
     normalized = value.strip()
@@ -163,17 +265,11 @@ def parse_clock_time(value: str) -> QTime | None:
 def create_startup_splash() -> QSplashScreen:
     """Показывает логотип, пока приложение открывает базу и строит интерфейс."""
     pixmap = QPixmap(str(ICON_DIR / "logo.png")).scaled(
-        320, 320,
+        160, 160,
         Qt.AspectRatioMode.KeepAspectRatio,
         Qt.TransformationMode.SmoothTransformation,
     )
-    splash = QSplashScreen(pixmap)
-    splash.showMessage(
-        "Загрузка журнала…",
-        Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom,
-        QColor("#ffffff"),
-    )
-    return splash
+    return QSplashScreen(pixmap)
 
 
 class TitleBar(QFrame):
@@ -234,7 +330,7 @@ class TitleBar(QFrame):
 
     def set_connection_state(self, available: bool) -> None:
         if available:
-            self.connection_chip.setText("● Локальная база")
+            self.connection_chip.setText("● Общая база")
             self.connection_chip.setStyleSheet("")
         else:
             self.connection_chip.setText("● База недоступна")
@@ -300,63 +396,231 @@ class TimeField(QLineEdit):
             self.style().polish(self)
 
 
+class StartupLogger:
+    """Короткий диагностический лог времени запуска без данных пациентов."""
+    def __init__(self) -> None:
+        self.enabled = self.settings_enable_logging()
+
+    @staticmethod
+    def settings_enable_logging() -> bool:
+        root = load_local_database_root()
+        settings = read_json_object(shared_settings_path(root)) if root else {}
+        if not settings:
+            settings = read_json_object(LOCAL_LEGACY_SETTINGS_PATH)
+        return settings.get("startup_logging") is True
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def log(self, stage: str) -> None:
+        if not self.enabled:
+            return
+        try:
+            LOG_DIR.mkdir(exist_ok=True)
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            elapsed_ms = (time.perf_counter() - PROCESS_STARTED_AT) * 1000
+            with STARTUP_LOG_PATH.open("a", encoding="utf-8") as file:
+                file.write(f"{timestamp}\t{elapsed_ms:8.1f} мс\t{stage}\n")
+        except OSError:
+            # Диагностика не должна влиять на доступность журнала.
+            pass
+
+
+ACTIVE_STARTUP_LOGGER: StartupLogger | None = None
+
+
 class DataStore:
     def __init__(self) -> None:
+        migrate_legacy_settings()
         self.settings = self.load_settings()
-        # База всегда поставляется и хранится рядом с приложением. Сбрасываем
-        # абсолютные пути из старых настроек, созданных на другом компьютере.
-        if self.settings.get("db_path") != str(DEFAULT_DB):
-            self.settings["db_path"] = str(DEFAULT_DB)
-            self.save_settings()
         self.conn: sqlite3.Connection | None = None
+        self.connected_root: Path | None = None
         self.error = ""
 
-    def load_settings(self) -> dict:
-        try:
-            source = json.loads(CONFIG_PATH.read_text(encoding="utf-8")) if CONFIG_PATH.exists() else {}
-        except (OSError, json.JSONDecodeError):
-            source = {}
+    @staticmethod
+    def validated_settings(source: dict, root: Path | None = None) -> dict:
         settings = {**DEFAULT_SETTINGS, **source}
+        settings.pop("db_path", None)
         for key in ("anesthesia_types", "doctors", "nurses"):
-            settings[key] = settings[key] if isinstance(settings.get(key), list) else DEFAULT_SETTINGS[key].copy()
+            value = settings.get(key)
+            settings[key] = list(value) if isinstance(value, list) else DEFAULT_SETTINGS[key].copy()
         dialog_size = settings.get("reference_dialog_size")
         if not (isinstance(dialog_size, list) and len(dialog_size) == 2 and all(isinstance(value, int) and value > 0 for value in dialog_size)):
             settings["reference_dialog_size"] = DEFAULT_SETTINGS["reference_dialog_size"].copy()
+        if not isinstance(settings.get("startup_logging"), bool):
+            settings["startup_logging"] = False
+        if not isinstance(settings.get("database_root"), str):
+            settings["database_root"] = ""
+        if root is not None:
+            settings["database_root"] = str(root)
         return settings
 
+    def load_settings(self) -> dict:
+        root = load_local_database_root()
+        source: dict = {}
+        if root is not None:
+            path = shared_settings_path(root)
+            if path.is_file():
+                source = read_json_object(path)
+        if not source:
+            source = read_json_object(LOCAL_LEGACY_SETTINGS_PATH)
+        if not source:
+            source = read_json_object(LEGACY_CONFIG_PATH)
+        return self.validated_settings(source, root)
+
     def save_settings(self) -> None:
-        CONFIG_PATH.write_text(json.dumps(self.settings, ensure_ascii=False, indent=2), encoding="utf-8")
+        root = self.database_root
+        if root is None:
+            raise OSError("Папка общей базы не выбрана")
+        self.settings["database_root"] = str(root)
+        write_json_atomic(shared_settings_path(root), self.settings)
+        write_json_atomic(LOCAL_CONNECTION_PATH, {"database_root": str(root)})
+        archive_local_legacy_settings()
+
+    @property
+    def database_root(self) -> Path | None:
+        value = self.settings["database_root"].strip()
+        return normalize_database_root(value) if value else None
+
+    @property
+    def is_configured(self) -> bool:
+        return self.database_root is not None
 
     @property
     def db_path(self) -> Path:
-        return DEFAULT_DB
+        root = self.connected_root or self.database_root
+        if root is None:
+            raise RuntimeError("Папка базы данных не выбрана")
+        return root / "data" / "journal.db"
 
-    def connect(self) -> bool:
-        self.close()
+    @property
+    def backup_dir(self) -> Path:
+        root = self.connected_root or self.database_root
+        if root is None:
+            raise RuntimeError("Папка базы данных не выбрана")
+        return root / "backups"
+
+    @property
+    def lock_path(self) -> Path:
+        root = self.database_root
+        if root is None:
+            raise RuntimeError("Папка базы данных не выбрана")
+        return root / ".journal.lock"
+
+    @property
+    def updates_dir(self) -> Path:
+        root = self.connected_root or self.database_root
+        if root is None:
+            raise RuntimeError("Папка базы данных не выбрана")
+        return root / "UPD"
+
+    @staticmethod
+    def prepare_shared_root(value: str | Path) -> Path:
+        """Проверяет доступ и создаёт служебную структуру общей папки."""
+        root = normalize_database_root(value)
+        if not root.is_dir():
+            raise FileNotFoundError("Указанная папка журнала не найдена")
+
+        probe = root / f".journal-access-{os.getpid()}.tmp"
         try:
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            self.conn = sqlite3.connect(self.db_path)
-            self.conn.row_factory = sqlite3.Row
-            self.conn.execute("PRAGMA journal_mode=WAL")
-            self.conn.executescript("""
-                CREATE TABLE IF NOT EXISTS patients (
-                    id INTEGER PRIMARY KEY, history_number TEXT NOT NULL UNIQUE, full_name TEXT NOT NULL,
-                    age INTEGER, operation_kind TEXT NOT NULL, operation_date TEXT NOT NULL,
-                    diagnosis TEXT, anesthesia_type TEXT NOT NULL, anesthesia_start TEXT, anesthesia_end TEXT,
-                    procedure_name TEXT, doctor TEXT, nurse TEXT,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE INDEX IF NOT EXISTS idx_patients_history ON patients(history_number);
-                CREATE INDEX IF NOT EXISTS idx_patients_name ON patients(full_name COLLATE NOCASE);
-                CREATE INDEX IF NOT EXISTS idx_patients_date ON patients(operation_date DESC, created_at DESC);
-            """)
-            self.conn.commit()
-            self.backup_if_needed()
+            probe.write_text("access", encoding="utf-8")
+            probe.unlink()
+            (root / "data").mkdir(parents=True, exist_ok=True)
+            (root / "backups").mkdir(parents=True, exist_ok=True)
+            (root / "UPD" / "releases").mkdir(parents=True, exist_ok=True)
+        finally:
+            try:
+                if probe.exists():
+                    probe.unlink()
+            except OSError:
+                pass
+        return root
+
+    def activate_shared_settings(self, value: str | Path) -> None:
+        """Загружает настройки выбранной базы или создаёт их рядом с ней."""
+        root = normalize_database_root(value)
+        previous_root = self.database_root
+        path = shared_settings_path(root)
+        if path.is_file():
+            source = read_json_object(path)
+        elif previous_root == root:
+            # Первый запуск 1.0.1: переносим локальные настройки версии 1.0.0.
+            source = self.settings
+        else:
+            source = {}
+        self.settings = self.validated_settings(source, root)
+        if previous_root != root:
+            self.settings["last_backup_week"] = ""
+        self.save_settings()
+
+    def set_database_root(self, value: str | Path) -> None:
+        self.activate_shared_settings(value)
+
+    @staticmethod
+    def _initialize_schema(connection: sqlite3.Connection) -> None:
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version > DATABASE_SCHEMA_VERSION:
+            raise sqlite3.DatabaseError(
+                "База создана более новой версией программы. Обновите приложение."
+            )
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS patients (
+                id INTEGER PRIMARY KEY, history_number TEXT NOT NULL UNIQUE, full_name TEXT NOT NULL,
+                age INTEGER, operation_kind TEXT NOT NULL, operation_date TEXT NOT NULL,
+                diagnosis TEXT, anesthesia_type TEXT NOT NULL, anesthesia_start TEXT, anesthesia_end TEXT,
+                procedure_name TEXT, doctor TEXT, nurse TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_patients_history ON patients(history_number);
+            CREATE INDEX IF NOT EXISTS idx_patients_name ON patients(full_name COLLATE NOCASE);
+            CREATE INDEX IF NOT EXISTS idx_patients_date ON patients(operation_date DESC, created_at DESC);
+        """)
+        required_columns = {
+            "id", "history_number", "full_name", "age", "operation_kind", "operation_date",
+            "diagnosis", "anesthesia_type", "anesthesia_start", "anesthesia_end",
+            "procedure_name", "doctor", "nurse", "created_at", "updated_at",
+        }
+        actual_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(patients)").fetchall()
+        }
+        if not required_columns.issubset(actual_columns):
+            raise sqlite3.DatabaseError("Структура выбранной базы данных не поддерживается")
+        if version < DATABASE_SCHEMA_VERSION:
+            connection.execute(f"PRAGMA user_version={DATABASE_SCHEMA_VERSION}")
+        connection.commit()
+
+    def connect(self, value: str | Path | None = None) -> bool:
+        target = normalize_database_root(value) if value is not None else self.database_root
+        if target is None:
+            self.error = "Папка базы данных не выбрана"
+            return False
+        new_connection: sqlite3.Connection | None = None
+        try:
+            target = self.prepare_shared_root(target)
+            new_connection = sqlite3.connect(target / "data" / "journal.db", timeout=5)
+            new_connection.row_factory = sqlite3.Row
+            new_connection.execute("PRAGMA busy_timeout=5000")
+            # WAL использует общий shm-файл и ненадёжен на сетевых ресурсах.
+            # Эксклюзивный lock приложения позволяет использовать обычный журнал.
+            new_connection.execute("PRAGMA journal_mode=DELETE")
+            self._initialize_schema(new_connection)
+            old_connection = self.conn
+            self.conn = new_connection
+            self.connected_root = target
+            if old_connection:
+                try:
+                    old_connection.close()
+                except sqlite3.Error:
+                    pass
             self.error = ""
             return True
         except (OSError, sqlite3.Error) as exc:
             self.error = str(exc)
-            self.close()
+            if new_connection:
+                try:
+                    new_connection.close()
+                except sqlite3.Error:
+                    pass
             return False
 
     def close(self) -> None:
@@ -364,29 +628,37 @@ class DataStore:
             try: self.conn.close()
             except sqlite3.Error: pass
         self.conn = None
+        self.connected_root = None
 
     def backup_if_needed(self) -> None:
         week = date.today().strftime("%G-W%V")
         if self.settings.get("last_backup_week") == week or not self.db_path.exists(): return
-        BACKUP_DIR.mkdir(exist_ok=True)
-        target = BACKUP_DIR / f"journal-{week}.db"
+        self.backup_dir.mkdir(exist_ok=True)
+        target = self.backup_dir / f"journal-{week}.db"
         if not target.exists():
-            with sqlite3.connect(target) as backup:
+            backup = sqlite3.connect(target)
+            try:
                 assert self.conn is not None
                 self.conn.backup(backup)
+                backup.commit()
+            finally:
+                backup.close()
         self.settings["last_backup_week"] = week
         self.save_settings()
 
 
 class ProgramInstanceLock:
     """Эксклюзивная блокировка для общей папки приложения в сети."""
-    def __init__(self) -> None:
+    def __init__(self, path: Path) -> None:
+        self.path = path
         self.handle: int | None = None
         self.overlapped = _Overlapped()
+        self.error_code = 0
 
     def acquire(self) -> bool:
+        ctypes.set_last_error(0)
         handle = _create_file(
-            str(INSTANCE_LOCK_PATH),
+            str(self.path),
             _GENERIC_READ | _GENERIC_WRITE,
             _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
             None,
@@ -395,11 +667,14 @@ class ProgramInstanceLock:
             None,
         )
         if handle == _INVALID_HANDLE_VALUE:
+            self.error_code = ctypes.get_last_error()
             return False
         if not _lock_file_ex(handle, _LOCKFILE_EXCLUSIVE_LOCK | _LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, ctypes.byref(self.overlapped)):
+            self.error_code = ctypes.get_last_error()
             _close_handle(handle)
             return False
         self.handle = handle
+        self.error_code = 0
         return True
 
     def release(self) -> None:
@@ -408,7 +683,7 @@ class ProgramInstanceLock:
         try:
             # Открываем файл с FILE_SHARE_DELETE: DeleteFileW помечает его к
             # удалению, но не даёт новой копии открыть старое имя до close.
-            _delete_file(str(INSTANCE_LOCK_PATH))
+            _delete_file(str(self.path))
         finally:
             _unlock_file_ex(self.handle, 0, 1, 0, ctypes.byref(self.overlapped))
             _close_handle(self.handle)
@@ -688,6 +963,412 @@ class ValidationErrorDialog(QDialog):
         self.setMask(QRegion(path.toFillPolygon().toPolygon()))
 
 
+class DatabaseFolderDialog(QDialog):
+    """Первичная настройка общей папки журнала и базы данных."""
+    def __init__(self, initial_path: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("referenceDialog")
+        self.setWindowTitle("Выбор папки журнала")
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setMinimumSize(560, 350)
+        self.resize(640, 380)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(1, 1, 1, 1)
+        outer.setSpacing(0)
+        outer.addWidget(DialogTitleBar(self, "Выбор папки журнала"))
+        body = QWidget()
+        body.setObjectName("dialogBody")
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(20, 20, 20, 20)
+        content = QFrame()
+        content.setObjectName("dialogContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(10)
+
+        eyebrow = QLabel("ПЕРВИЧНАЯ НАСТРОЙКА")
+        eyebrow.setObjectName("dialogEyebrow")
+        title = QLabel("Где находится общий журнал?")
+        title.setObjectName("dialogTitle")
+        details = QLabel(
+            "Выберите общую папку. При необходимости в ней будут созданы "
+            "data\\journal.db, backups и UPD."
+        )
+        details.setObjectName("muted")
+        details.setWordWrap(True)
+        row = QHBoxLayout()
+        self.path_field = QLineEdit(initial_path)
+        self.path_field.setPlaceholderText(
+            "//fs.acrb-amursk.ru/common/РАО/Пациенты/Jornal-oper"
+        )
+        self.path_field.setClearButtonEnabled(True)
+        self.path_field.returnPressed.connect(self.accept)
+        browse = QPushButton("Выбрать папку")
+        browse.setObjectName("outline")
+        browse.clicked.connect(self.choose_folder)
+        row.addWidget(self.path_field, 1)
+        row.addWidget(browse)
+        self.error_label = QLabel()
+        self.error_label.setObjectName("muted")
+        self.error_label.setStyleSheet("color:#d1544d;")
+        self.error_label.setWordWrap(True)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        cancel = QPushButton("Отмена")
+        cancel.setObjectName("outline")
+        cancel.clicked.connect(self.reject)
+        continue_button = QPushButton("Подключить")
+        continue_button.setObjectName("primary")
+        continue_button.clicked.connect(self.accept)
+        actions.addWidget(cancel)
+        actions.addWidget(continue_button)
+        layout.addWidget(eyebrow)
+        layout.addWidget(title)
+        layout.addWidget(details)
+        layout.addLayout(row)
+        layout.addWidget(self.error_label)
+        layout.addStretch()
+        layout.addLayout(actions)
+        body_layout.addWidget(content)
+        outer.addWidget(body, 1)
+        self.path_field.setFocus()
+        self.update_window_mask()
+
+    def choose_folder(self) -> None:
+        current = self.path_field.text().strip()
+        try:
+            initial = str(normalize_database_root(current)) if current else str(APP_DIR)
+        except (OSError, ValueError):
+            initial = str(APP_DIR)
+        path = QFileDialog.getExistingDirectory(
+            self, "Выберите папку журнала", initial, QFileDialog.Option.ShowDirsOnly
+        )
+        if path:
+            self.path_field.setText(path)
+            self.error_label.clear()
+
+    def selected_path(self) -> Path | None:
+        value = self.path_field.text().strip()
+        return normalize_database_root(value) if value else None
+
+    def accept(self) -> None:
+        path = self.selected_path()
+        if path is None:
+            self.error_label.setText("Укажите папку общего журнала.")
+            return
+        try:
+            DataStore.prepare_shared_root(path)
+        except OSError:
+            self.error_label.setText(
+                "Нет доступа к этой папке. Проверьте сеть и права на запись "
+                "или обратитесь к системному администратору."
+            )
+            return
+        super().accept()
+
+    def update_window_mask(self) -> None:
+        path = QPainterPath(); path.addRoundedRect(QRectF(self.rect()), 10, 10); self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.update_window_mask()
+
+
+class DatabaseAccessDialog(QDialog):
+    """Выбор действия, когда сохранённая общая база недоступна."""
+
+    RETRY = 1
+    CHOOSE_ANOTHER = 2
+
+    def __init__(self, path: Path, details: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("referenceDialog")
+        self.setWindowTitle("Нет доступа к базе данных")
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setFixedSize(620, 380)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(1, 1, 1, 1)
+        outer.setSpacing(0)
+        outer.addWidget(DialogTitleBar(self, "Нет доступа к базе данных"))
+        body = QWidget()
+        body.setObjectName("dialogBody")
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(20, 20, 20, 20)
+        content = QFrame()
+        content.setObjectName("dialogContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(10)
+
+        eyebrow = QLabel("ПОДКЛЮЧЕНИЕ НЕ ВЫПОЛНЕНО")
+        eyebrow.setObjectName("dialogWarning")
+        heading = QLabel("Нет доступа к базе данных")
+        heading.setObjectName("dialogTitle")
+        message = QLabel(
+            "Проверьте подключение к сети или обратитесь к системному администратору. "
+            "Можно повторить попытку либо указать другую общую базу."
+        )
+        message.setObjectName("muted")
+        message.setWordWrap(True)
+        path_label = QLineEdit(str(path))
+        path_label.setReadOnly(True)
+        path_label.setToolTip(str(path))
+        technical = QLabel(details)
+        technical.setObjectName("muted")
+        technical.setWordWrap(True)
+        technical.setVisible(bool(details))
+
+        actions = QHBoxLayout()
+        close = QPushButton("Закрыть программу")
+        close.setObjectName("outline")
+        close.clicked.connect(self.reject)
+        choose = QPushButton("Указать другую базу")
+        choose.setObjectName("outline")
+        choose.clicked.connect(lambda: self.done(self.CHOOSE_ANOTHER))
+        retry = QPushButton("Повторить")
+        retry.setObjectName("primary")
+        retry.clicked.connect(lambda: self.done(self.RETRY))
+        actions.addWidget(close)
+        actions.addStretch()
+        actions.addWidget(choose)
+        actions.addWidget(retry)
+
+        layout.addWidget(eyebrow)
+        layout.addWidget(heading)
+        layout.addWidget(message)
+        layout.addWidget(path_label)
+        layout.addWidget(technical)
+        layout.addStretch()
+        layout.addLayout(actions)
+        body_layout.addWidget(content)
+        outer.addWidget(body, 1)
+        self.update_window_mask()
+        retry.setFocus()
+
+    def update_window_mask(self) -> None:
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), 10, 10)
+        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
+
+class UpdateProgressDialog(QDialog):
+    """Отзывчивое окно с фактическим прогрессом обновления."""
+
+    retry_requested = Signal()
+
+    def __init__(
+        self,
+        current_version: str,
+        target_version: str,
+        close_text: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("referenceDialog")
+        self.setWindowTitle("Обновление журнала")
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setFixedSize(560, 340)
+        self.busy = True
+        self._base_status = "Подготовка обновления"
+        self._pulse_step = 0
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(1, 1, 1, 1)
+        outer.setSpacing(0)
+        outer.addWidget(DialogTitleBar(self, "Обновление журнала"))
+        body = QWidget()
+        body.setObjectName("dialogBody")
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(20, 20, 20, 20)
+        content = QFrame()
+        content.setObjectName("dialogContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(10)
+
+        eyebrow = QLabel("ОБНОВЛЕНИЕ ПРОГРАММЫ")
+        eyebrow.setObjectName("dialogEyebrow")
+        title = QLabel(f"Версия {current_version} → {target_version}")
+        title.setObjectName("dialogTitle")
+        self.status_label = QLabel(self._base_status)
+        self.status_label.setObjectName("muted")
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.percent_label = QLabel("0%")
+        self.percent_label.setObjectName("muted")
+        self.details = QLabel("Окно продолжает обновляться во время работы. Не выключайте компьютер.")
+        self.details.setObjectName("muted")
+        self.details.setWordWrap(True)
+        progress_row = QHBoxLayout()
+        progress_row.addWidget(self.progress, 1)
+        progress_row.addWidget(self.percent_label)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        self.close_button = QPushButton(close_text)
+        self.close_button.setObjectName("outline")
+        self.close_button.clicked.connect(self.accept)
+        self.close_button.hide()
+        self.retry_button = QPushButton("Повторить")
+        self.retry_button.setObjectName("primary")
+        self.retry_button.clicked.connect(self.retry_requested.emit)
+        self.retry_button.hide()
+        actions.addWidget(self.close_button)
+        actions.addWidget(self.retry_button)
+
+        layout.addWidget(eyebrow)
+        layout.addWidget(title)
+        layout.addWidget(self.status_label)
+        layout.addLayout(progress_row)
+        layout.addWidget(self.details)
+        layout.addStretch()
+        layout.addLayout(actions)
+        body_layout.addWidget(content)
+        outer.addWidget(body, 1)
+        self.update_window_mask()
+
+        self.pulse_timer = QTimer(self)
+        self.pulse_timer.timeout.connect(self.animate_activity)
+        self.pulse_timer.start(350)
+
+    def reject(self) -> None:
+        if self.busy:
+            return
+        super().reject()
+
+    def animate_activity(self) -> None:
+        if not self.busy:
+            return
+        self._pulse_step = (self._pulse_step + 1) % 4
+        self.status_label.setText(self._base_status + "." * self._pulse_step)
+
+    def set_progress(self, percent: int, status: str) -> None:
+        self.busy = True
+        self._base_status = status
+        self.status_label.setText(status)
+        value = max(0, min(100, percent))
+        self.progress.setValue(value)
+        self.percent_label.setText(f"{value}%")
+
+    def set_error(self, message: str) -> None:
+        self.busy = False
+        self.pulse_timer.stop()
+        self._base_status = "Не удалось установить обновление"
+        self.status_label.setText(self._base_status)
+        self.details.setText(message)
+        self.close_button.show()
+        self.retry_button.show()
+        self.retry_button.setFocus()
+
+    def set_success(self) -> None:
+        self.busy = False
+        self.pulse_timer.stop()
+        self.set_progress(100, "Обновление установлено")
+        self.busy = False
+        self.details.setText("Новая версия будет использована при следующем запуске журнала.")
+        self.retry_button.hide()
+        self.close_button.setText("Готово")
+        self.close_button.show()
+
+    def reset_for_retry(self) -> None:
+        self.busy = True
+        self.details.setText("Окно продолжает обновляться во время работы. Не выключайте компьютер.")
+        self.close_button.hide()
+        self.retry_button.hide()
+        self.pulse_timer.start(350)
+        self.set_progress(0, "Повторная подготовка обновления")
+
+    def update_window_mask(self) -> None:
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), 10, 10)
+        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
+
+class PrepareUpdateWorker(QObject):
+    progress = Signal(int, str)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, release: ReleaseInfo) -> None:
+        super().__init__()
+        self.release = release
+
+    def run(self) -> None:
+        try:
+            stage = prepare_release(
+                self.release,
+                UPDATE_CACHE_DIR,
+                lambda percent, status: self.progress.emit(percent, status),
+            )
+            self.finished.emit(stage)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class ApplyUpdateWorker(QObject):
+    progress = Signal(int, str)
+    finished = Signal()
+    failed = Signal(str)
+
+    def __init__(self, stage_dir: Path, target_dir: Path, parent_process_id: int) -> None:
+        super().__init__()
+        self.stage_dir = stage_dir
+        self.target_dir = target_dir
+        self.parent_process_id = parent_process_id
+
+    def run(self) -> None:
+        try:
+            apply_staged_update(
+                self.stage_dir,
+                self.target_dir,
+                self.parent_process_id,
+                lambda percent, status: self.progress.emit(percent, status),
+            )
+            self.finished.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+def open_database_root(
+    store: DataStore,
+    value: str | Path,
+    persist: bool,
+) -> tuple[ProgramInstanceLock | None, str, str]:
+    """Подготавливает папку, получает общий lock и открывает SQLite."""
+    try:
+        root = DataStore.prepare_shared_root(value)
+    except OSError as exc:
+        return None, "access", str(exc)
+
+    instance_lock = ProgramInstanceLock(root / ".journal.lock")
+    if not instance_lock.acquire():
+        if instance_lock.error_code == 33:
+            return None, "locked", "Общий файл журнала уже заблокирован."
+        return None, "access", f"Не удалось создать файл блокировки (код {instance_lock.error_code})."
+
+    if not store.connect(root):
+        instance_lock.release()
+        return None, "access", store.error
+
+    try:
+        # Общий settings.json становится активным только после успешного
+        # подключения к выбранной базе и получения сетевой блокировки.
+        store.activate_shared_settings(root)
+    except OSError as exc:
+        store.close()
+        instance_lock.release()
+        return None, "access", str(exc)
+    try:
+        store.backup_if_needed()
+    except (OSError, sqlite3.Error):
+        # Ошибка резервной копии не должна лишать доступа к основной БД.
+        pass
+    return instance_lock, "ok", ""
+
+
 class ReferenceCard(QFrame):
     def __init__(self, owner: "JournalWindow", title: str, key: str, singular: str) -> None:
         super().__init__(); self.owner, self.key, self.title = owner, key, title
@@ -734,11 +1415,30 @@ class JournalWindow(QMainWindow):
     headers = ["№ истории", "ФИО", "Возраст", "Операция", "Дата операции", "Диагноз", "Вид наркоза", "Начало", "Окончание", "Длительность", "Название операции", "Врач", "Медсестра"]
     widths = [105, 175, 62, 100, 105, 150, 135, 68, 88, 95, 165, 120, 122]
 
-    def __init__(self) -> None:
-        super().__init__(); self.store = DataStore(); self.page = 0; self.total = 0; self.editing_history: str | None = None
+    def __init__(self, store: DataStore | None = None, instance_lock: ProgramInstanceLock | None = None) -> None:
+        super().__init__()
+        if ACTIVE_STARTUP_LOGGER: ACTIVE_STARTUP_LOGGER.log("Создание главного окна")
+        self.store = store or DataStore()
+        self.instance_lock = instance_lock
+        self.page = 0
+        self.total = 0
+        self.editing_history: str | None = None
+        self._update_in_progress = False
+        self._skip_update_on_close = False
+        self._pending_release: ReleaseInfo | None = None
+        self._update_thread: QThread | None = None
+        self._update_worker: PrepareUpdateWorker | None = None
+        self.update_dialog: UpdateProgressDialog | None = None
+        if ACTIVE_STARTUP_LOGGER: ACTIVE_STARTUP_LOGGER.log("Настройки загружены")
         self.setWindowTitle("Журнал пациентов"); self.setWindowIcon(QIcon(str(ICON_DIR / "logo.png"))); self.setWindowFlag(Qt.WindowType.FramelessWindowHint); self.resize(1540, 900); self.setMinimumSize(1160, 720); self.setStyleSheet(QSS)
         self.restore_window_geometry()
-        self.build(); self.update_window_mask(); self.store.connect(); self.show_patients()
+        self.build(); self.update_window_mask()
+        if ACTIVE_STARTUP_LOGGER: ACTIVE_STARTUP_LOGGER.log("Интерфейс построен")
+        if self.store.conn is None:
+            self.store.connect()
+        if ACTIVE_STARTUP_LOGGER: ACTIVE_STARTUP_LOGGER.log("Подключение к базе завершено")
+        self.show_patients()
+        if ACTIVE_STARTUP_LOGGER: ACTIVE_STARTUP_LOGGER.log("Начальные данные загружены")
         QTimer.singleShot(0, self.restore_maximized_state)
 
     def build(self) -> None:
@@ -802,7 +1502,108 @@ class JournalWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.save_window_geometry()
+        if self._update_in_progress:
+            event.ignore()
+            return
+        if self._skip_update_on_close or not IS_FROZEN or self.store.conn is None:
+            self.store.close()
+            self.release_instance_lock()
+            event.accept()
+            return
+        try:
+            release = find_newer_release(self.store.updates_dir, APP_VERSION)
+        except (OSError, RuntimeError):
+            release = None
+        if release is not None:
+            event.ignore()
+            self.begin_update(release)
+            return
+        self.store.close()
+        self.release_instance_lock()
         super().closeEvent(event)
+
+    def begin_update(self, release: ReleaseInfo) -> None:
+        self._update_in_progress = True
+        self._pending_release = release
+        self.hide()
+        self.update_dialog = UpdateProgressDialog(
+            APP_VERSION,
+            release.version,
+            "Закрыть без обновления",
+            None,
+        )
+        self.update_dialog.retry_requested.connect(self.retry_update)
+        self.update_dialog.accepted.connect(self.close_without_update)
+        self.update_dialog.show()
+        self.start_prepare_update()
+
+    def start_prepare_update(self) -> None:
+        if self._pending_release is None or self.update_dialog is None:
+            return
+        self.update_dialog.reset_for_retry()
+        thread = QThread(self)
+        worker = PrepareUpdateWorker(self._pending_release)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self.update_dialog.set_progress)
+        worker.finished.connect(self.update_prepared)
+        worker.failed.connect(self.update_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        self._update_thread = thread
+        self._update_worker = worker
+        thread.start()
+
+    def retry_update(self) -> None:
+        if self._update_thread and self._update_thread.isRunning():
+            return
+        self.start_prepare_update()
+
+    def update_prepared(self, stage_dir: Path) -> None:
+        if self._pending_release is None or self.update_dialog is None:
+            return
+        self.update_dialog.set_progress(70, "Запуск установщика обновления")
+        executable = stage_dir / "JournalPatients.exe"
+        command = [
+            str(executable),
+            "--apply-update",
+            "--target", str(APP_DIR),
+            "--parent-pid", str(os.getpid()),
+            "--from-version", APP_VERSION,
+            "--version", self._pending_release.version,
+        ]
+        try:
+            subprocess.Popen(
+                command,
+                cwd=str(stage_dir),
+                close_fds=True,
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            )
+        except OSError as exc:
+            self.update_failed(str(exc))
+            return
+        self.store.close()
+        self.release_instance_lock()
+        self._skip_update_on_close = True
+        self._update_in_progress = False
+        self.update_dialog.hide()
+        QApplication.quit()
+
+    def update_failed(self, message: str) -> None:
+        if self.update_dialog:
+            self.update_dialog.set_error(
+                message or "Проверьте доступ к общей папке UPD и повторите попытку."
+            )
+
+    def close_without_update(self) -> None:
+        if self.update_dialog and self.update_dialog.busy:
+            return
+        self._skip_update_on_close = True
+        self._update_in_progress = False
+        self.store.close()
+        self.release_instance_lock()
+        QApplication.quit()
 
     def changeEvent(self, event) -> None:
         if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "titlebar"):
@@ -897,8 +1698,16 @@ class JournalWindow(QMainWindow):
         cards = QHBoxLayout(); self.reference_cards = [ReferenceCard(self, "Виды наркоза", "anesthesia_types", "вид"), ReferenceCard(self, "Врачи", "doctors", "врача"), ReferenceCard(self, "Медсестры", "nurses", "медсестру")]
         for card in self.reference_cards: cards.addWidget(card, 1)
         layout.addLayout(cards)
-        storage = QFrame(); storage.setObjectName("card"); grid = QGridLayout(storage); grid.setContentsMargins(18,18,18,18); grid.setSpacing(9); label = QLabel("Хранение данных"); label.setObjectName("section"); grid.addWidget(label, 0, 0, 1, 3); grid.addWidget(QLabel("Путь к базе данных", objectName="muted"), 1,0,1,3)
-        self.path_field = QLineEdit(); self.path_field.setReadOnly(True); grid.addWidget(self.path_field, 2,0,1,3); note = QLabel("База всегда хранится в папке data рядом с программой."); note.setObjectName("muted"); grid.addWidget(note, 3,0,1,3); self.connection_status = QLabel(); self.connection_status.setObjectName("muted"); grid.addWidget(self.connection_status, 4,0,1,3); layout.addWidget(storage); layout.addStretch(); return page
+        storage = QFrame(); storage.setObjectName("card"); grid = QGridLayout(storage); grid.setContentsMargins(18,18,18,18); grid.setSpacing(9); label = QLabel("Хранение данных"); label.setObjectName("section"); grid.addWidget(label, 0, 0, 1, 3); grid.addWidget(QLabel("Папка общего журнала", objectName="muted"), 1,0,1,3)
+        self.path_field = QLineEdit(); self.path_field.setPlaceholderText("//fs.acrb-amursk.ru/common/РАО/Пациенты/Jornal-oper"); grid.addWidget(self.path_field, 2,0); choose = QPushButton("Выбрать папку"); choose.setObjectName("outline"); choose.clicked.connect(self.choose_database_root); grid.addWidget(choose,2,1); save = QPushButton("Подключить"); save.setObjectName("primary"); save.clicked.connect(self.save_database_root); grid.addWidget(save,2,2)
+        note = QLabel("База: data\\journal.db; блокировка: .journal.lock; релизы: UPD в выбранной папке."); note.setObjectName("muted"); note.setWordWrap(True); grid.addWidget(note, 3,0,1,3); self.connection_status = QLabel(); self.connection_status.setObjectName("muted"); grid.addWidget(self.connection_status, 4,0,1,3); layout.addWidget(storage)
+        diagnostics = QFrame(); diagnostics.setObjectName("card"); diagnostics_layout = QVBoxLayout(diagnostics); diagnostics_layout.setContentsMargins(18, 15, 18, 15); diagnostics_layout.setSpacing(5)
+        diagnostics_title = QLabel("Диагностика запуска"); diagnostics_title.setObjectName("section"); diagnostics_layout.addWidget(diagnostics_title)
+        self.startup_logging_checkbox = QCheckBox("Записывать лог запуска")
+        self.startup_logging_checkbox.toggled.connect(self.set_startup_logging)
+        diagnostics_layout.addWidget(self.startup_logging_checkbox)
+        diagnostics_note = QLabel(f"Версия {APP_VERSION}. Лог содержит только время этапов запуска и сохраняется в локальном профиле Windows. После измерения отключите запись."); diagnostics_note.setObjectName("muted"); diagnostics_note.setWordWrap(True); diagnostics_layout.addWidget(diagnostics_note)
+        layout.addWidget(diagnostics); layout.addStretch(); return page
 
     def make_report_page(self) -> QWidget:
         page = QWidget(); layout = self.page_layout(page)
@@ -949,7 +1758,10 @@ class JournalWindow(QMainWindow):
         self.select_page(0, self.nav_patients); self.refresh_patient_state()
 
     def show_settings(self) -> None:
-        self.select_page(1, self.nav_settings); self.path_field.setText(self.store.settings["db_path"]); self.refresh_references(); self.update_connection_status()
+        self.select_page(1, self.nav_settings); self.path_field.setText(str(self.store.database_root or "")); self.refresh_references(); self.update_connection_status()
+        self.startup_logging_checkbox.blockSignals(True)
+        self.startup_logging_checkbox.setChecked(self.store.settings["startup_logging"])
+        self.startup_logging_checkbox.blockSignals(False)
 
     def show_reports(self) -> None:
         self.select_page(2, self.nav_reports)
@@ -1021,7 +1833,27 @@ class JournalWindow(QMainWindow):
         if available: self.load_patients()
         else: self.table.setRowCount(0); self.page_info.setText("База недоступна")
 
-    def retry_connection(self) -> None: self.store.connect(); self.refresh_patient_state(); self.update_connection_status()
+    def retry_connection(self) -> None:
+        root = self.store.database_root
+        if root is None:
+            self.choose_database_root()
+            return
+        while not self.store.connect(root):
+            dialog = DatabaseAccessDialog(root, self.store.error, self)
+            action = dialog.exec()
+            if action == DatabaseAccessDialog.RETRY:
+                continue
+            if action == DatabaseAccessDialog.CHOOSE_ANOTHER:
+                self.choose_database_root()
+            break
+        try:
+            if self.store.conn:
+                self.store.activate_shared_settings(root)
+                self.store.backup_if_needed()
+        except (OSError, sqlite3.Error):
+            pass
+        self.refresh_patient_state()
+        self.update_connection_status()
 
     def where_clause(self) -> tuple[str, list[str]]:
         clauses, params = [], []
@@ -1151,31 +1983,243 @@ class JournalWindow(QMainWindow):
             box = self.fields[key]; value=box.currentText(); box.clear(); box.addItems(self.store.settings[source]); box.setCurrentText(value)
 
     def persist_references(self) -> None: self.store.save_settings(); self.refresh_references()
+    def choose_database_root(self) -> None:
+        dialog = DatabaseFolderDialog(self.path_field.text().strip(), self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_path():
+            self.path_field.setText(str(dialog.selected_path()))
+            self.save_database_root()
+
+    def save_database_root(self) -> None:
+        value = self.path_field.text().strip()
+        root = normalize_database_root(value) if value else None
+        if root is None:
+            self.show_validation_error("Папка журнала", "Укажите папку общего журнала.")
+            return
+        try:
+            root = DataStore.prepare_shared_root(root)
+        except OSError as exc:
+            dialog = DatabaseAccessDialog(root, str(exc), self)
+            if dialog.exec() == DatabaseAccessDialog.CHOOSE_ANOTHER:
+                self.choose_database_root()
+            return
+        current_root = self.store.database_root
+        if current_root == root:
+            if not self.store.connect(root):
+                DatabaseAccessDialog(root, self.store.error, self).exec()
+            else:
+                try:
+                    self.store.activate_shared_settings(root)
+                except OSError as exc:
+                    DatabaseAccessDialog(root, str(exc), self).exec()
+            self.refresh_patient_state()
+            self.update_connection_status()
+            return
+
+        new_lock = ProgramInstanceLock(root / ".journal.lock")
+        if not new_lock.acquire():
+            if new_lock.error_code == 33:
+                self.show_validation_error(
+                    "Журнал уже открыт",
+                    "Выбранная общая база сейчас используется на другом компьютере.",
+                )
+            else:
+                DatabaseAccessDialog(
+                    root,
+                    f"Не удалось создать файл блокировки (код {new_lock.error_code}).",
+                    self,
+                ).exec()
+            return
+        if not self.store.connect(root):
+            new_lock.release()
+            DatabaseAccessDialog(root, self.store.error, self).exec()
+            return
+        try:
+            self.store.set_database_root(root)
+        except OSError:
+            if current_root is not None:
+                self.store.connect(current_root)
+                try:
+                    self.store.activate_shared_settings(current_root)
+                except OSError:
+                    pass
+            new_lock.release()
+            self.show_validation_error(
+                "Не удалось сохранить путь",
+                "Проверьте доступ к локальному профилю Windows.",
+            )
+            return
+        if self.instance_lock:
+            self.instance_lock.release()
+        self.instance_lock = new_lock
+        try:
+            self.store.backup_if_needed()
+        except (OSError, sqlite3.Error):
+            pass
+        self.path_field.setText(str(root))
+        self.refresh_patient_state()
+        self.update_connection_status()
+
+    def release_instance_lock(self) -> None:
+        if self.instance_lock:
+            self.instance_lock.release()
+            self.instance_lock = None
+    def set_startup_logging(self, enabled: bool) -> None:
+        if ACTIVE_STARTUP_LOGGER and ACTIVE_STARTUP_LOGGER.enabled and not enabled:
+            ACTIVE_STARTUP_LOGGER.log("Запись диагностического лога отключена")
+        self.store.settings["startup_logging"] = enabled
+        try:
+            self.store.save_settings()
+        except OSError:
+            self.startup_logging_checkbox.blockSignals(True)
+            self.startup_logging_checkbox.setChecked(not enabled)
+            self.startup_logging_checkbox.blockSignals(False)
+            return
+        if ACTIVE_STARTUP_LOGGER:
+            ACTIVE_STARTUP_LOGGER.set_enabled(enabled)
+            if enabled:
+                ACTIVE_STARTUP_LOGGER.log("Запись диагностического лога включена")
     def update_connection_status(self) -> None:
-        if self.store.conn: self.connection_status.setText("База доступна и хранится рядом с программой."); self.connection_status.setStyleSheet("color:#16835a;")
-        else: self.connection_status.setText("База недоступна. Проверьте доступ к папке data рядом с программой."); self.connection_status.setStyleSheet("color:#b05600;")
+        if self.store.conn: self.connection_status.setText("База доступна в выбранной общей папке."); self.connection_status.setStyleSheet("color:#16835a;")
+        else: self.connection_status.setText("База недоступна. Проверьте путь к общей папке и доступ к каталогу data."); self.connection_status.setStyleSheet("color:#b05600;")
 
 
-if __name__ == "__main__":
+def parse_arguments(arguments: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--apply-update", action="store_true")
+    parser.add_argument("--target", default="")
+    parser.add_argument("--parent-pid", type=int, default=0)
+    parser.add_argument("--from-version", default=APP_VERSION)
+    parser.add_argument("--version", default=APP_VERSION)
+    parsed, _ = parser.parse_known_args(arguments[1:])
+    return parsed
+
+
+def run_update_installer(app: QApplication, arguments: argparse.Namespace) -> int:
+    stage_dir = Path(sys.executable).resolve().parent
+    target_dir = Path(arguments.target).resolve() if arguments.target else APP_DIR
+    dialog = UpdateProgressDialog(
+        arguments.from_version,
+        arguments.version,
+        "Закрыть",
+        None,
+    )
+    thread_holder: dict[str, object] = {}
+
+    def start_worker() -> None:
+        existing = thread_holder.get("thread")
+        if isinstance(existing, QThread) and existing.isRunning():
+            return
+        dialog.reset_for_retry()
+        thread = QThread()
+        worker = ApplyUpdateWorker(stage_dir, target_dir, arguments.parent_pid)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(dialog.set_progress)
+        worker.finished.connect(dialog.set_success)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(dialog.set_error)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread_holder["thread"] = thread
+        thread_holder["worker"] = worker
+        thread.start()
+
+    dialog.retry_requested.connect(start_worker)
+    dialog.accepted.connect(app.quit)
+    dialog.show()
+    start_worker()
+    return app.exec()
+
+
+def establish_startup_database(
+    store: DataStore,
+    splash: QSplashScreen,
+) -> ProgramInstanceLock | None:
+    root = store.database_root
+    persist = False
+    while True:
+        if root is None:
+            splash.close()
+            picker = DatabaseFolderDialog()
+            if picker.exec() != QDialog.DialogCode.Accepted:
+                if ACTIVE_STARTUP_LOGGER:
+                    ACTIVE_STARTUP_LOGGER.log("Запуск отменён: папка журнала не выбрана")
+                return None
+            root = picker.selected_path()
+            persist = True
+            if root is None:
+                continue
+
+        instance_lock, status, details = open_database_root(store, root, persist)
+        if status == "ok" and instance_lock is not None:
+            splash.show()
+            QApplication.processEvents()
+            if ACTIVE_STARTUP_LOGGER:
+                ACTIVE_STARTUP_LOGGER.log("Общая база подключена")
+            return instance_lock
+
+        splash.close()
+        if status == "locked":
+            if ACTIVE_STARTUP_LOGGER:
+                ACTIVE_STARTUP_LOGGER.log("Запуск отменён: экземпляр уже открыт")
+            ValidationErrorDialog(
+                "Программа уже открыта",
+                "Журнал уже используется на другом компьютере. "
+                "Закройте его там, прежде чем продолжить работу здесь.",
+                None,
+            ).exec()
+            return None
+
+        if ACTIVE_STARTUP_LOGGER:
+            ACTIVE_STARTUP_LOGGER.log("Общая база недоступна")
+        access_dialog = DatabaseAccessDialog(root, details, None)
+        action = access_dialog.exec()
+        if action == DatabaseAccessDialog.RETRY:
+            continue
+        if action == DatabaseAccessDialog.CHOOSE_ANOTHER:
+            picker = DatabaseFolderDialog(str(root))
+            if picker.exec() != QDialog.DialogCode.Accepted:
+                return None
+            root = picker.selected_path()
+            persist = True
+            continue
+        return None
+
+
+def main() -> int:
+    global ACTIVE_STARTUP_LOGGER
+    migrate_legacy_settings()
+    arguments = parse_arguments(sys.argv)
     app = QApplication(sys.argv)
     # Fusion не использует нестабильные растровые эффекты WindowsVistaStyle
     # при наведении и фокусе, из-за которых Qt мог выводить QPainter-предупреждения.
     app.setStyle("Fusion")
+    app.setStyleSheet(QSS)
     app.setWindowIcon(QIcon(str(ICON_DIR / "logo.png")))
+
+    if arguments.apply_update:
+        return run_update_installer(app, arguments)
+
+    ACTIVE_STARTUP_LOGGER = StartupLogger()
+    ACTIVE_STARTUP_LOGGER.log("Запуск приложения: импорт Python и Qt завершён")
+    ACTIVE_STARTUP_LOGGER.log("Qt-приложение создано")
     splash = create_startup_splash()
     splash.show()
     app.processEvents()
-    instance_lock = ProgramInstanceLock()
-    if not instance_lock.acquire():
-        splash.close()
-        ValidationErrorDialog(
-            "Программа уже открыта",
-            "Журнал уже используется на другом компьютере. Закройте его там, прежде чем продолжить работу здесь.",
-            None,
-        ).exec()
-        sys.exit(0)
-    app.aboutToQuit.connect(instance_lock.release)
-    window = JournalWindow()
+    ACTIVE_STARTUP_LOGGER.log("Стартовая заставка показана")
+    store = DataStore()
+    instance_lock = establish_startup_database(store, splash)
+    if instance_lock is None:
+        return 0
+    ACTIVE_STARTUP_LOGGER.set_enabled(store.settings.get("startup_logging") is True)
+    ACTIVE_STARTUP_LOGGER.log("Блокировка единственного экземпляра получена")
+    window = JournalWindow(store, instance_lock)
+    app.aboutToQuit.connect(window.release_instance_lock)
     window.show()
     splash.finish(window)
-    sys.exit(app.exec())
+    ACTIVE_STARTUP_LOGGER.log("Главное окно показано; запуск завершён")
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

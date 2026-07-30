@@ -23,6 +23,7 @@ exe = EXE(
     exclude_binaries=True,
     name='JournalPatients',
     icon='assets/icons/logo.ico',
+    version='windows_version_info.txt',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

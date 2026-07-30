@@ -3,5 +3,8 @@ __pycache__/
 settings.json
 data/
 backups/
+logs/
+updates/
 build/
 dist/
+windows_version_info.txt
