@@ -13,11 +13,11 @@ from datetime import date, datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, QSize, QTime, QTimer, Qt
-from PySide6.QtGui import QColor, QIcon, QPainterPath, QRegion
+from PySide6.QtGui import QColor, QIcon, QPainterPath, QPixmap, QRegion
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QComboBox, QDialog, QFrame, QGridLayout,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
-    QMainWindow, QMessageBox, QPushButton, QRadioButton, QScrollArea,
+    QMainWindow, QMessageBox, QPushButton, QRadioButton, QScrollArea, QSplashScreen,
     QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -158,6 +158,22 @@ def parse_clock_time(value: str) -> QTime | None:
         if parsed.isValid():
             return parsed
     return None
+
+
+def create_startup_splash() -> QSplashScreen:
+    """Показывает логотип, пока приложение открывает базу и строит интерфейс."""
+    pixmap = QPixmap(str(ICON_DIR / "logo.png")).scaled(
+        320, 320,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    splash = QSplashScreen(pixmap)
+    splash.showMessage(
+        "Загрузка журнала…",
+        Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom,
+        QColor("#ffffff"),
+    )
+    return splash
 
 
 class TitleBar(QFrame):
@@ -1146,8 +1162,12 @@ if __name__ == "__main__":
     # при наведении и фокусе, из-за которых Qt мог выводить QPainter-предупреждения.
     app.setStyle("Fusion")
     app.setWindowIcon(QIcon(str(ICON_DIR / "logo.png")))
+    splash = create_startup_splash()
+    splash.show()
+    app.processEvents()
     instance_lock = ProgramInstanceLock()
     if not instance_lock.acquire():
+        splash.close()
         ValidationErrorDialog(
             "Программа уже открыта",
             "Журнал уже используется на другом компьютере. Закройте его там, прежде чем продолжить работу здесь.",
@@ -1157,4 +1177,5 @@ if __name__ == "__main__":
     app.aboutToQuit.connect(instance_lock.release)
     window = JournalWindow()
     window.show()
+    splash.finish(window)
     sys.exit(app.exec())
