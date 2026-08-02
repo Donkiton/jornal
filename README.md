@@ -134,7 +134,7 @@ python build_release.py
 ```text
 dist/
 ├── JournalPatients/          # переносимая onedir-сборка
-└── JournalPatients-1.0.3.zip # архив релиза
+└── JournalPatients-1.0.4.zip # архив релиза
 ```
 
 Для публикации в общую папку обновлений:

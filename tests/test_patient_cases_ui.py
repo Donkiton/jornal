@@ -10,7 +10,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QDialog
+from PySide6.QtWidgets import QApplication, QDialog, QScrollArea
 
 import modern_app
 from database_schema import initialize_schema
@@ -142,6 +142,15 @@ class PatientCasesUiTests(unittest.TestCase):
         self.assertEqual(self.window.table.rowCount(), 15)
         self.assertEqual(self.window.total, 17)
         self.assertEqual(self.window.page_info.text(), "Показано 1–15 из 17")
+
+    def test_maximized_quick_form_has_no_horizontal_scrollbar(self) -> None:
+        self.window.showMaximized()
+        self.application.processEvents()
+
+        scroll_area = self.window.form_card.findChild(QScrollArea)
+        self.assertIsNotNone(scroll_area)
+        self.assertEqual(self.window.form_card.width(), 355)
+        self.assertEqual(scroll_area.horizontalScrollBar().maximum(), 0)
 
     def test_memo_navigation_displays_contained_image(self) -> None:
         self.window.show()
