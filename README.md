@@ -105,7 +105,7 @@ cd jornal
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install PySide6
+python -m pip install -r requirements.txt
 python modern_app.py
 ```
 
@@ -122,10 +122,10 @@ python modern_app.py
 
 ## Сборка релиза
 
-Для сборки Windows-приложения установите PyInstaller и запустите единый сценарий релиза:
+Для сборки Windows-приложения установите зафиксированные зависимости сборки и запустите единый сценарий релиза:
 
 ```powershell
-python -m pip install PySide6 pyinstaller
+python -m pip install -r requirements-build.txt
 python build_release.py
 ```
 
@@ -172,6 +172,8 @@ python -m unittest discover -s tests -v
 | [`update_system.py`](./update_system.py) | Проверка и установка обновлений |
 | [`build_release.py`](./build_release.py) | Сборка и публикация релиза |
 | [`JournalPatients.spec`](./JournalPatients.spec) | Конфигурация PyInstaller |
+| [`requirements.txt`](./requirements.txt) | Зависимости для запуска из исходного кода |
+| [`requirements-build.txt`](./requirements-build.txt) | Дополнительные зависимости для сборки релиза |
 | [`tests/`](./tests) | Регрессионные тесты |
 | [`ATTRIBUTION.md`](./ATTRIBUTION.md) | Атрибуция иконок интерфейса |
 
