@@ -15,6 +15,8 @@ from datetime import date, datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from database_schema import initialize_schema
+
 
 # В собранном приложении служебный __file__ указывает внутрь пакета,
 # поэтому пользовательские данные всегда привязываем к папке самого .exe.
@@ -46,7 +48,7 @@ class JournalApp(tk.Tk):
         self.db_error = ""
         self.page = 0
         self.total_rows = 0
-        self.editing_history: str | None = None
+        self.editing_patient_id: int | None = None
 
         self.configure_style()
         self.build_layout()
@@ -101,31 +103,7 @@ class JournalApp(tk.Tk):
 
     def create_schema(self) -> None:
         assert self.db is not None
-        self.db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS patients (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                history_number TEXT NOT NULL UNIQUE,
-                full_name TEXT NOT NULL,
-                age INTEGER,
-                operation_kind TEXT NOT NULL DEFAULT 'Плановая',
-                operation_date TEXT NOT NULL,
-                diagnosis TEXT,
-                anesthesia_type TEXT NOT NULL,
-                anesthesia_start TEXT,
-                anesthesia_end TEXT,
-                procedure_name TEXT,
-                doctor TEXT,
-                nurse TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE INDEX IF NOT EXISTS idx_patients_history ON patients(history_number);
-            CREATE INDEX IF NOT EXISTS idx_patients_name ON patients(full_name COLLATE NOCASE);
-            CREATE INDEX IF NOT EXISTS idx_patients_date ON patients(operation_date DESC, created_at DESC);
-            """
-        )
-        self.db.commit()
+        initialize_schema(self.db)
 
     def create_weekly_backup(self) -> None:
         """Копия создаётся при первом успешном запуске в текущую ISO-неделю."""
@@ -400,7 +378,7 @@ class JournalApp(tk.Tk):
         self.clear_tree()
         for row in rows:
             duration = self.duration_text(row["anesthesia_start"], row["anesthesia_end"])
-            self.tree.insert("", "end", iid=row["history_number"], values=(
+            self.tree.insert("", "end", iid=str(row["id"]), values=(
                 row["history_number"], row["full_name"], row["age"] or "—", row["operation_kind"], row["operation_date"],
                 row["diagnosis"] or "—", row["anesthesia_type"], row["anesthesia_start"] or "—", row["anesthesia_end"] or "—",
                 duration, row["procedure_name"] or "—", row["doctor"] or "—", row["nurse"] or "—",
@@ -487,19 +465,19 @@ class JournalApp(tk.Tk):
             return
         values = (data["history"], data["name"], int(data["age"]) if data["age"] else None, data["kind"], data["date"], data["diagnosis"], data["anesthesia"], data["start"], data["end"], data["procedure"], data["doctor"], data["nurse"])
         try:
-            if self.editing_history is None:
+            if self.editing_patient_id is None:
                 self.db.execute(
                     "INSERT INTO patients (history_number, full_name, age, operation_kind, operation_date, diagnosis, anesthesia_type, anesthesia_start, anesthesia_end, procedure_name, doctor, nurse) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     values,
                 )
             else:
                 self.db.execute(
-                    "UPDATE patients SET history_number=?, full_name=?, age=?, operation_kind=?, operation_date=?, diagnosis=?, anesthesia_type=?, anesthesia_start=?, anesthesia_end=?, procedure_name=?, doctor=?, nurse=?, updated_at=CURRENT_TIMESTAMP WHERE history_number=?",
-                    (*values, self.editing_history),
+                    "UPDATE patients SET history_number=?, full_name=?, age=?, operation_kind=?, operation_date=?, diagnosis=?, anesthesia_type=?, anesthesia_start=?, anesthesia_end=?, procedure_name=?, doctor=?, nurse=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (*values, self.editing_patient_id),
                 )
             self.db.commit()
         except sqlite3.IntegrityError:
-            messagebox.showwarning("Не удалось сохранить", "Запись с таким № истории уже существует.")
+            messagebox.showwarning("Не удалось сохранить", "Проверьте обязательные поля записи.")
             return
         except sqlite3.Error as error:
             self.db_error = str(error)
@@ -512,14 +490,14 @@ class JournalApp(tk.Tk):
     def start_edit(self) -> None:
         if self.db is None or not self.tree.selection():
             return
-        history = self.tree.selection()[0]
+        patient_id = int(self.tree.selection()[0])
         try:
-            row = self.db.execute("SELECT * FROM patients WHERE history_number = ?", (history,)).fetchone()
+            row = self.db.execute("SELECT * FROM patients WHERE id = ?", (patient_id,)).fetchone()
         except sqlite3.Error:
             return
         if row is None:
             return
-        self.editing_history = history
+        self.editing_patient_id = int(row["id"])
         mapping = {"history": "history_number", "name": "full_name", "age": "age", "kind": "operation_kind", "date": "operation_date", "diagnosis": "diagnosis", "anesthesia": "anesthesia_type", "start": "anesthesia_start", "end": "anesthesia_end", "procedure": "procedure_name", "doctor": "doctor", "nurse": "nurse"}
         for form_key, db_key in mapping.items():
             self.form_fields[form_key].set(row[db_key] or "")
@@ -529,7 +507,7 @@ class JournalApp(tk.Tk):
         self.update_duration()
 
     def cancel_edit(self) -> None:
-        self.editing_history = None
+        self.editing_patient_id = None
         for key, var in self.form_fields.items():
             var.set("Плановая" if key == "kind" else "")
         self.form_fields["date"].set(date.today().isoformat())
