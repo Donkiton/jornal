@@ -127,6 +127,35 @@ class PatientCasesUiTests(unittest.TestCase):
             [(self.first_id, "42")],
         )
 
+    def test_first_page_shows_fifteen_rows(self) -> None:
+        for index in range(15):
+            insert_case(
+                self.store.conn,
+                history_number=f"page-{index}",
+                full_name=f"Пациент страницы {index}",
+                operation_date="2026-01-01",
+            )
+
+        self.window.load_patients()
+
+        self.assertEqual(modern_app.PAGE_SIZE, 15)
+        self.assertEqual(self.window.table.rowCount(), 15)
+        self.assertEqual(self.window.total, 17)
+        self.assertEqual(self.window.page_info.text(), "Показано 1–15 из 17")
+
+    def test_memo_navigation_displays_contained_image(self) -> None:
+        self.window.show()
+        self.window.show_memo()
+        self.application.processEvents()
+
+        self.assertIs(self.window.stack.currentWidget(), self.window.memo_page)
+        self.assertTrue(self.window.nav_memo.isChecked())
+        pixmap = self.window.memo_image_label.pixmap()
+        self.assertIsNotNone(pixmap)
+        self.assertFalse(pixmap.isNull())
+        self.assertLessEqual(pixmap.width(), self.window.memo_image_label.width())
+        self.assertLessEqual(pixmap.height(), self.window.memo_image_label.height())
+
 
 if __name__ == "__main__":
     unittest.main()

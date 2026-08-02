@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/версия-1.0.2-1769e0?style=flat-square" alt="Версия 1.0.2">
+  <img src="https://img.shields.io/badge/версия-1.0.3-1769e0?style=flat-square" alt="Версия 1.0.3">
   <img src="https://img.shields.io/badge/платформа-Windows-1769e0?style=flat-square" alt="Платформа Windows">
   <img src="https://img.shields.io/badge/Python-3.10%2B-3776ab?style=flat-square" alt="Python 3.10 или новее">
   <img src="https://img.shields.io/badge/UI-PySide6-41cd52?style=flat-square" alt="Интерфейс PySide6">
@@ -134,7 +134,7 @@ python build_release.py
 ```text
 dist/
 ├── JournalPatients/          # переносимая onedir-сборка
-└── JournalPatients-1.0.2.zip # архив релиза
+└── JournalPatients-1.0.3.zip # архив релиза
 ```
 
 Для публикации в общую папку обновлений:
