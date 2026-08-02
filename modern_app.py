@@ -51,7 +51,7 @@ ICON_DIR = RESOURCE_DIR / "assets" / "icons"
 LOG_DIR = LOCAL_STATE_DIR / "logs"
 STARTUP_LOG_PATH = LOG_DIR / "startup.log"
 UPDATE_CACHE_DIR = LOCAL_STATE_DIR / "updates"
-PAGE_SIZE = 10
+PAGE_SIZE = 15
 DEFAULT_SETTINGS = {
     "database_root": "", "last_backup_week": "",
     "window_geometry": None,
@@ -271,6 +271,45 @@ def create_startup_splash() -> QSplashScreen:
         Qt.TransformationMode.SmoothTransformation,
     )
     return QSplashScreen(pixmap)
+
+
+class ContainedPixmapLabel(QLabel):
+    """Показывает изображение целиком, сохраняя пропорции при изменении размера."""
+
+    def __init__(self, image_path: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._source_pixmap = QPixmap(str(image_path))
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(1, 1)
+        self.setWordWrap(True)
+        self.setObjectName("memoImage")
+        if self._source_pixmap.isNull():
+            self.setObjectName("memoFallback")
+            self.setText("Не удалось загрузить памятку.")
+        else:
+            self._refresh_pixmap()
+
+    @property
+    def source_pixmap(self) -> QPixmap:
+        return self._source_pixmap
+
+    def _refresh_pixmap(self) -> None:
+        if self._source_pixmap.isNull():
+            return
+        available = self.contentsRect().size()
+        if available.width() <= 0 or available.height() <= 0:
+            return
+        self.setPixmap(
+            self._source_pixmap.scaled(
+                available,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._refresh_pixmap()
 
 
 class TitleBar(QFrame):
@@ -1422,11 +1461,12 @@ class JournalWindow(QMainWindow):
         brand = QLabel("ЖУРНАЛ"); brand.setStyleSheet("color:#9aa6b8;font-size:11px;font-weight:700;letter-spacing:1.4px;padding:0 10px 14px;"); side.addWidget(brand)
         self.nav_group = QButtonGroup(self); self.nav_group.setExclusive(True)
         self.nav_patients = self.nav_button("Журнал", "journal.png", True, self.show_patients); side.addWidget(self.nav_patients)
-        self.nav_reports = self.nav_button("Отчёты", "reports.png", False, self.show_reports); side.addWidget(self.nav_reports); side.addStretch()
+        self.nav_reports = self.nav_button("Отчёты", "reports.png", False, self.show_reports); side.addWidget(self.nav_reports)
+        self.nav_memo = self.nav_button("Памятка", "memo.png", False, self.show_memo); side.addWidget(self.nav_memo); side.addStretch()
         self.nav_settings = self.nav_button("Настройки", "settings.png", False, self.show_settings); side.addWidget(self.nav_settings); shell.addWidget(sidebar)
         self.stack = QStackedWidget(); shell.addWidget(self.stack, 1)
-        self.patient_page = self.make_patient_page(); self.settings_page = self.make_settings_page(); self.report_page = self.make_report_page()
-        self.stack.addWidget(self.patient_page); self.stack.addWidget(self.settings_page); self.stack.addWidget(self.report_page)
+        self.patient_page = self.make_patient_page(); self.settings_page = self.make_settings_page(); self.report_page = self.make_report_page(); self.memo_page = self.make_memo_page()
+        self.stack.addWidget(self.patient_page); self.stack.addWidget(self.settings_page); self.stack.addWidget(self.report_page); self.stack.addWidget(self.memo_page)
         for widget in self.findChildren(QWidget):
             widget.setMouseTracking(True)
             widget.installEventFilter(self)
@@ -1707,6 +1747,19 @@ class JournalWindow(QMainWindow):
         self.report_status = QLabel(); self.report_status.setObjectName("muted"); layout.addWidget(self.report_status)
         return page
 
+    def make_memo_page(self) -> QWidget:
+        page = QWidget()
+        layout = self.page_layout(page)
+        card = QFrame()
+        card.setObjectName("card")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(16, 16, 16, 16)
+        self.memo_image_label = ContainedPixmapLabel(ICON_DIR / "pamatka.png")
+        self.memo_image = self.memo_image_label
+        card_layout.addWidget(self.memo_image_label, 1)
+        layout.addWidget(card, 1)
+        return page
+
     @staticmethod
     def make_report_metric(label_text: str, parent_layout: QHBoxLayout) -> QLabel:
         card = QFrame(); card.setObjectName("card"); card_layout = QVBoxLayout(card); card_layout.setContentsMargins(18, 14, 18, 14); card_layout.setSpacing(2)
@@ -1738,6 +1791,10 @@ class JournalWindow(QMainWindow):
     def show_reports(self) -> None:
         self.select_page(2, self.nav_reports)
         self.refresh_report()
+
+    def show_memo(self) -> None:
+        self.stack.setCurrentWidget(self.memo_page)
+        self.nav_memo.setChecked(True)
 
     def report_where_clause(self) -> tuple[str, list[str]]:
         clauses, params = [], []
