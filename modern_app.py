@@ -28,7 +28,8 @@ from PySide6.QtWidgets import (
     QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from app_version import APP_VERSION, DATABASE_SCHEMA_VERSION
+from app_version import APP_VERSION
+from database_schema import initialize_schema
 from update_system import ReleaseInfo, apply_staged_update, find_newer_release, prepare_release
 
 
@@ -558,36 +559,7 @@ class DataStore:
 
     @staticmethod
     def _initialize_schema(connection: sqlite3.Connection) -> None:
-        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if version > DATABASE_SCHEMA_VERSION:
-            raise sqlite3.DatabaseError(
-                "База создана более новой версией программы. Обновите приложение."
-            )
-        connection.executescript("""
-            CREATE TABLE IF NOT EXISTS patients (
-                id INTEGER PRIMARY KEY, history_number TEXT NOT NULL UNIQUE, full_name TEXT NOT NULL,
-                age INTEGER, operation_kind TEXT NOT NULL, operation_date TEXT NOT NULL,
-                diagnosis TEXT, anesthesia_type TEXT NOT NULL, anesthesia_start TEXT, anesthesia_end TEXT,
-                procedure_name TEXT, doctor TEXT, nurse TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE INDEX IF NOT EXISTS idx_patients_history ON patients(history_number);
-            CREATE INDEX IF NOT EXISTS idx_patients_name ON patients(full_name COLLATE NOCASE);
-            CREATE INDEX IF NOT EXISTS idx_patients_date ON patients(operation_date DESC, created_at DESC);
-        """)
-        required_columns = {
-            "id", "history_number", "full_name", "age", "operation_kind", "operation_date",
-            "diagnosis", "anesthesia_type", "anesthesia_start", "anesthesia_end",
-            "procedure_name", "doctor", "nurse", "created_at", "updated_at",
-        }
-        actual_columns = {
-            str(row[1]) for row in connection.execute("PRAGMA table_info(patients)").fetchall()
-        }
-        if not required_columns.issubset(actual_columns):
-            raise sqlite3.DatabaseError("Структура выбранной базы данных не поддерживается")
-        if version < DATABASE_SCHEMA_VERSION:
-            connection.execute(f"PRAGMA user_version={DATABASE_SCHEMA_VERSION}")
-        connection.commit()
+        initialize_schema(connection)
 
     def connect(self, value: str | Path | None = None) -> bool:
         target = normalize_database_root(value) if value is not None else self.database_root
@@ -1422,7 +1394,7 @@ class JournalWindow(QMainWindow):
         self.instance_lock = instance_lock
         self.page = 0
         self.total = 0
-        self.editing_history: str | None = None
+        self.editing_patient_id: int | None = None
         self._update_in_progress = False
         self._skip_update_on_close = False
         self._pending_release: ReleaseInfo | None = None
@@ -1877,7 +1849,7 @@ class JournalWindow(QMainWindow):
         for r, row in enumerate(rows):
             values = [row["history_number"], row["full_name"], str(row["age"] or "—"), row["operation_kind"], row["operation_date"], row["diagnosis"] or "—", row["anesthesia_type"], row["anesthesia_start"] or "—", row["anesthesia_end"] or "—", self.duration_text(row["anesthesia_start"], row["anesthesia_end"]), row["procedure_name"] or "—", row["doctor"] or "—", row["nurse"] or "—"]
             for c, value in enumerate(values):
-                item = QTableWidgetItem(value); item.setData(Qt.ItemDataRole.UserRole, row["history_number"])
+                item = QTableWidgetItem(value); item.setData(Qt.ItemDataRole.UserRole, row["id"])
                 if c == 3: item.setForeground(QColor("#1769e0") if value == "Плановая" else QColor("#d84d4d"))
                 self.table.setItem(r,c,item)
             self.table.setRowHeight(r, 48)
@@ -1934,39 +1906,46 @@ class JournalWindow(QMainWindow):
         if not self.validate(data): return
         vals = (data["history"], data["name"], int(data["age"]) if data["age"] else None, data["kind"], data["date"], data["diagnosis"], data["anesthesia"], data["start"], data["end"], data["procedure"], data["doctor"], data["nurse"])
         try:
-            if self.editing_history is None: self.store.conn.execute("INSERT INTO patients(history_number,full_name,age,operation_kind,operation_date,diagnosis,anesthesia_type,anesthesia_start,anesthesia_end,procedure_name,doctor,nurse) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", vals)
-            else: self.store.conn.execute("UPDATE patients SET history_number=?,full_name=?,age=?,operation_kind=?,operation_date=?,diagnosis=?,anesthesia_type=?,anesthesia_start=?,anesthesia_end=?,procedure_name=?,doctor=?,nurse=?,updated_at=CURRENT_TIMESTAMP WHERE history_number=?", (*vals, self.editing_history))
+            if self.editing_patient_id is None: self.store.conn.execute("INSERT INTO patients(history_number,full_name,age,operation_kind,operation_date,diagnosis,anesthesia_type,anesthesia_start,anesthesia_end,procedure_name,doctor,nurse) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", vals)
+            else: self.store.conn.execute("UPDATE patients SET history_number=?,full_name=?,age=?,operation_kind=?,operation_date=?,diagnosis=?,anesthesia_type=?,anesthesia_start=?,anesthesia_end=?,procedure_name=?,doctor=?,nurse=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (*vals, self.editing_patient_id))
             self.store.conn.commit()
         except sqlite3.IntegrityError:
-            self.show_validation_error("Не удалось сохранить", "Запись с таким № истории уже существует.")
+            self.show_validation_error("Не удалось сохранить", "Проверьте обязательные поля записи.")
             return
         except sqlite3.Error as exc: self.store.error=str(exc); self.store.close(); self.refresh_patient_state(); return
         self.cancel_edit(); self.load_patients()
 
     def start_edit(self) -> None:
         if not self.store.conn or not self.table.selectedItems(): return
-        history = self.table.selectedItems()[0].data(Qt.ItemDataRole.UserRole); row = self.store.conn.execute("SELECT * FROM patients WHERE history_number=?",(history,)).fetchone()
+        patient_id = self.table.selectedItems()[0].data(Qt.ItemDataRole.UserRole); row = self.store.conn.execute("SELECT * FROM patients WHERE id=?",(patient_id,)).fetchone()
         if not row: return
-        self.editing_history = history
+        self.editing_patient_id = int(row["id"])
         mapping = {"history":"history_number","name":"full_name","age":"age","date":"operation_date","diagnosis":"diagnosis","anesthesia":"anesthesia_type","start":"anesthesia_start","end":"anesthesia_end","procedure":"procedure_name","doctor":"doctor","nurse":"nurse"}
         for key,column in mapping.items():
             target=self.fields[key]; value=str(row[column] or ""); target.setCurrentText(value) if isinstance(target,QComboBox) else target.setText(value)
         self.kind_planned.setChecked(row["operation_kind"] == "Плановая"); self.kind_emergency.setChecked(row["operation_kind"] == "Экстренная"); self.form_title.setText("Редактирование пациента"); self.save_button.setText("Сохранить изменения"); self.cancel_button.show(); self.delete_patient_button.show(); self.update_duration()
 
     def cancel_edit(self) -> None:
-        self.editing_history=None
+        self.editing_patient_id=None
         for key, target in self.fields.items(): target.setCurrentText("") if isinstance(target,QComboBox) else target.setText("")
         self.fields["date"].setText(date.today().isoformat()); self.kind_planned.setChecked(True); self.form_title.setText("Быстрое добавление"); self.save_button.setText("Добавить пациента"); self.cancel_button.hide(); self.delete_patient_button.hide(); self.update_duration()
 
     def delete_patient(self) -> None:
-        if not self.store.conn or self.editing_history is None:
+        if not self.store.conn or self.editing_patient_id is None:
             return
-        patient_name = self.fields["name"].text().strip() or "без указанного ФИО"
-        dialog = PatientDeleteDialog(patient_name, self.editing_history, self)
+        row = self.store.conn.execute(
+            "SELECT full_name, history_number FROM patients WHERE id=?",
+            (self.editing_patient_id,),
+        ).fetchone()
+        if row is None:
+            return
+        dialog = PatientDeleteDialog(
+            str(row["full_name"]), str(row["history_number"]), self
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
-            self.store.conn.execute("DELETE FROM patients WHERE history_number=?", (self.editing_history,))
+            self.store.conn.execute("DELETE FROM patients WHERE id=?", (self.editing_patient_id,))
             self.store.conn.commit()
         except sqlite3.Error as exc:
             self.store.error = str(exc)

@@ -1,4 +1,4 @@
 """Единый источник версии приложения и формата базы данных."""
 
-APP_VERSION = "1.0.1"
-DATABASE_SCHEMA_VERSION = 1
+APP_VERSION = "1.0.2"
+DATABASE_SCHEMA_VERSION = 2
