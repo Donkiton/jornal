@@ -1684,7 +1684,7 @@ class JournalWindow(QMainWindow):
         return page
 
     def make_quick_form(self) -> QFrame:
-        card = QFrame(); card.setObjectName("card"); card.setFixedWidth(330); outer = QVBoxLayout(card); outer.setContentsMargins(0,0,0,0)
+        card = QFrame(); card.setObjectName("card"); card.setFixedWidth(355); outer = QVBoxLayout(card); outer.setContentsMargins(0,0,0,0)
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.Shape.NoFrame); inner = QWidget(); form = QVBoxLayout(inner); form.setContentsMargins(18,18,18,18); form.setSpacing(7)
         self.form_title = QLabel("Быстрое добавление"); self.form_title.setObjectName("section"); form.addWidget(self.form_title); note = QLabel("* обязательные поля"); note.setObjectName("muted"); form.addWidget(note)
         self.fields: dict[str, QWidget] = {}; self.input_widgets: list[QWidget] = []
@@ -1698,7 +1698,7 @@ class JournalWindow(QMainWindow):
         time_row = QHBoxLayout(); start_box = TimeField(); end_box = TimeField(); self.fields["start"], self.fields["end"] = start_box, end_box; self.input_widgets += [start_box, end_box]
         for title, box in (("Начало", start_box), ("Окончание", end_box)):
             col = QVBoxLayout(); lab = QLabel(title); lab.setObjectName("muted"); col.addWidget(lab); col.addWidget(box); time_row.addLayout(col)
-        form.addLayout(time_row); duration_label = QLabel("Длительность · рассчитывается автоматически"); duration_label.setObjectName("muted"); form.addWidget(duration_label); self.duration = QLineEdit("—"); self.duration.setReadOnly(True); form.addWidget(self.duration); start_box.textChanged.connect(self.update_duration); end_box.textChanged.connect(self.update_duration)
+        form.addLayout(time_row); duration_label = QLabel("Длительность · рассчитывается автоматически"); duration_label.setObjectName("muted"); duration_label.setWordWrap(True); form.addWidget(duration_label); self.duration = QLineEdit("—"); self.duration.setReadOnly(True); form.addWidget(self.duration); start_box.textChanged.connect(self.update_duration); end_box.textChanged.connect(self.update_duration)
         text("Название операции", "procedure"); combo("Врач", "doctor", self.store.settings["doctors"]); combo("Медсестра", "nurse", self.store.settings["nurses"])
         self.save_button = QPushButton("Добавить пациента"); self.save_button.setObjectName("primary"); self.save_button.clicked.connect(self.save_patient); form.addWidget(self.save_button)
         self.cancel_button = QPushButton("Отмена"); self.cancel_button.setObjectName("outline"); self.cancel_button.clicked.connect(self.cancel_edit); self.cancel_button.hide(); form.addWidget(self.cancel_button)
