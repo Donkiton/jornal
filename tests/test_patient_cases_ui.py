@@ -143,6 +143,27 @@ class PatientCasesUiTests(unittest.TestCase):
         self.assertEqual(self.window.total, 17)
         self.assertEqual(self.window.page_info.text(), "Показано 1–15 из 17")
 
+    def test_overnight_duration_and_department_are_saved_and_shown(self) -> None:
+        self.assertEqual(JournalWindow.duration_text("23:10", "03:00"), "3 ч 50 мин")
+        self.assertEqual(JournalWindow.duration_text("08:00", "09:00"), "1 ч 0 мин")
+
+        self.window.fields["history"].setText("overnight")
+        self.window.fields["name"].setText("Ночной пациент")
+        self.window.fields["anesthesia"].setCurrentText("Общая")
+        self.window.fields["start"].setText("23:10")
+        self.window.fields["end"].setText("03:00")
+        self.window.department_buttons["Хирургия"].setChecked(True)
+        self.window.save_patient()
+
+        saved_department = self.store.conn.execute(
+            "SELECT department FROM patients WHERE history_number='overnight'"
+        ).fetchone()[0]
+        self.assertEqual(saved_department, "Хирургия")
+        self.assertEqual(self.window.table.item(0, 4).text(), "Хирургия")
+
+    def test_department_is_optional_and_not_selected_by_default(self) -> None:
+        self.assertIsNone(self.window.department_group.checkedButton())
+
     def test_maximized_quick_form_has_no_horizontal_scrollbar(self) -> None:
         self.window.showMaximized()
         self.application.processEvents()

@@ -103,6 +103,28 @@ class DatabaseSchemaTests(unittest.TestCase):
             DATABASE_SCHEMA_VERSION,
         )
 
+    def test_existing_database_is_migrated_with_optional_department(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        connection.executescript(
+            OLD_SCHEMA.replace(" NOT NULL UNIQUE", " NOT NULL").replace(
+                "PRAGMA user_version=1;", "PRAGMA user_version=2;"
+            )
+        )
+        patient_id = insert_patient(connection)
+
+        initialize_schema(connection)
+
+        self.assertEqual(
+            connection.execute(
+                "SELECT department FROM patients WHERE id=?", (patient_id,)
+            ).fetchone()[0],
+            None,
+        )
+        self.assertIn(
+            "department",
+            {row[1] for row in connection.execute("PRAGMA table_info(patients)")},
+        )
+
     def test_database_from_newer_application_is_rejected(self) -> None:
         connection = sqlite3.connect(":memory:")
         connection.execute(f"PRAGMA user_version={DATABASE_SCHEMA_VERSION + 1}")
