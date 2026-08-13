@@ -1423,8 +1423,8 @@ class ReferenceCard(QFrame):
 
 
 class JournalWindow(QMainWindow):
-    headers = ["№ истории", "ФИО", "Возраст", "Операция", "Дата операции", "Диагноз", "Вид наркоза", "Начало", "Окончание", "Длительность", "Название операции", "Врач", "Медсестра"]
-    widths = [105, 175, 62, 100, 105, 150, 135, 68, 88, 95, 165, 120, 122]
+    headers = ["№ истории", "ФИО", "Возраст", "Операция", "Отделение", "Дата операции", "Диагноз", "Вид наркоза", "Начало", "Окончание", "Длительность", "Название операции", "Врач", "Медсестра"]
+    widths = [105, 175, 62, 100, 120, 105, 150, 135, 68, 88, 95, 165, 120, 122]
 
     def __init__(self, store: DataStore | None = None, instance_lock: ProgramInstanceLock | None = None) -> None:
         super().__init__()
@@ -1694,6 +1694,11 @@ class JournalWindow(QMainWindow):
             lab = QLabel(label + (" *" if required else "")); lab.setObjectName("muted"); form.addWidget(lab); box = QComboBox(); box.setEditable(True); box.addItems(values); form.addWidget(box); self.fields[key] = box; self.input_widgets.append(box)
         text("№ истории", "history", True); text("ФИО", "name", True); text("Возраст", "age", False)
         form.addWidget(QLabel("Операция", objectName="muted")); kinds = QHBoxLayout(); self.kind_group = QButtonGroup(self); self.kind_planned = QRadioButton("Плановая"); self.kind_emergency = QRadioButton("Экстренная"); self.kind_planned.setChecked(True); self.kind_group.addButton(self.kind_planned); self.kind_group.addButton(self.kind_emergency); kinds.addWidget(self.kind_planned); kinds.addWidget(self.kind_emergency); form.addLayout(kinds); self.input_widgets += [self.kind_planned, self.kind_emergency]
+        form.addWidget(QLabel("Отделение", objectName="muted")); departments = QVBoxLayout(); self.department_group = QButtonGroup(self)
+        self.department_buttons: dict[str, QRadioButton] = {}
+        for department in ("Гинекология", "Хирургия", "Травматология", "Другое"):
+            button = QRadioButton(department); self.department_group.addButton(button); self.department_buttons[department] = button; departments.addWidget(button); self.input_widgets.append(button)
+        departments.setContentsMargins(0, 0, 0, 0); form.addLayout(departments)
         text("Дата операции", "date", True, "ГГГГ-ММ-ДД"); self.fields["date"].setText(date.today().isoformat()); text("Диагноз", "diagnosis"); combo("Вид наркоза", "anesthesia", self.store.settings["anesthesia_types"], True)
         time_row = QHBoxLayout(); start_box = TimeField(); end_box = TimeField(); self.fields["start"], self.fields["end"] = start_box, end_box; self.input_widgets += [start_box, end_box]
         for title, box in (("Начало", start_box), ("Окончание", end_box)):
@@ -1904,7 +1909,7 @@ class JournalWindow(QMainWindow):
         self.table.clearContents()
         self.table.setRowCount(len(rows))
         for r, row in enumerate(rows):
-            values = [row["history_number"], row["full_name"], str(row["age"] or "—"), row["operation_kind"], row["operation_date"], row["diagnosis"] or "—", row["anesthesia_type"], row["anesthesia_start"] or "—", row["anesthesia_end"] or "—", self.duration_text(row["anesthesia_start"], row["anesthesia_end"]), row["procedure_name"] or "—", row["doctor"] or "—", row["nurse"] or "—"]
+            values = [row["history_number"], row["full_name"], str(row["age"] or "—"), row["operation_kind"], row["department"] or "—", row["operation_date"], row["diagnosis"] or "—", row["anesthesia_type"], row["anesthesia_start"] or "—", row["anesthesia_end"] or "—", self.duration_text(row["anesthesia_start"], row["anesthesia_end"]), row["procedure_name"] or "—", row["doctor"] or "—", row["nurse"] or "—"]
             for c, value in enumerate(values):
                 item = QTableWidgetItem(value); item.setData(Qt.ItemDataRole.UserRole, row["id"])
                 if c == 3: item.setForeground(QColor("#1769e0") if value == "Плановая" else QColor("#d84d4d"))
@@ -1924,7 +1929,7 @@ class JournalWindow(QMainWindow):
         end_time = JournalWindow.parse_time(end)
         if not start_time or not end_time: return "Укажите ЧЧ:ММ"
         minutes = start_time.secsTo(end_time) // 60
-        if minutes < 0: return "Проверьте время"
+        if minutes < 0: minutes += 24 * 60
         return f"{minutes//60} ч {minutes%60} мин" if minutes >= 60 else f"{minutes} мин"
 
     @staticmethod
@@ -1934,8 +1939,15 @@ class JournalWindow(QMainWindow):
     def update_duration(self) -> None: self.duration.setText(self.duration_text(self.fields["start"].text().strip(), self.fields["end"].text().strip()))
     def field_value(self, key: str) -> str: return self.fields[key].currentText().strip() if isinstance(self.fields[key], QComboBox) else self.fields[key].text().strip()
 
+    def set_department(self, department: str) -> None:
+        self.department_group.setExclusive(False)
+        for name, button in self.department_buttons.items():
+            button.setChecked(name == department)
+        self.department_group.setExclusive(True)
+
     def form_data(self) -> dict[str,str]:
-        return {key:self.field_value(key) for key in self.fields} | {"kind":"Плановая" if self.kind_planned.isChecked() else "Экстренная"}
+        selected_department = self.department_group.checkedButton()
+        return {key:self.field_value(key) for key in self.fields} | {"kind":"Плановая" if self.kind_planned.isChecked() else "Экстренная", "department": selected_department.text() if selected_department else ""}
 
     def show_validation_error(self, title: str, message: str) -> None:
         ValidationErrorDialog(title, message, self).exec()
@@ -1961,10 +1973,10 @@ class JournalWindow(QMainWindow):
         if not self.store.conn: return
         data = self.form_data()
         if not self.validate(data): return
-        vals = (data["history"], data["name"], int(data["age"]) if data["age"] else None, data["kind"], data["date"], data["diagnosis"], data["anesthesia"], data["start"], data["end"], data["procedure"], data["doctor"], data["nurse"])
+        vals = (data["history"], data["name"], int(data["age"]) if data["age"] else None, data["kind"], data["department"], data["date"], data["diagnosis"], data["anesthesia"], data["start"], data["end"], data["procedure"], data["doctor"], data["nurse"])
         try:
-            if self.editing_patient_id is None: self.store.conn.execute("INSERT INTO patients(history_number,full_name,age,operation_kind,operation_date,diagnosis,anesthesia_type,anesthesia_start,anesthesia_end,procedure_name,doctor,nurse) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", vals)
-            else: self.store.conn.execute("UPDATE patients SET history_number=?,full_name=?,age=?,operation_kind=?,operation_date=?,diagnosis=?,anesthesia_type=?,anesthesia_start=?,anesthesia_end=?,procedure_name=?,doctor=?,nurse=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (*vals, self.editing_patient_id))
+            if self.editing_patient_id is None: self.store.conn.execute("INSERT INTO patients(history_number,full_name,age,operation_kind,department,operation_date,diagnosis,anesthesia_type,anesthesia_start,anesthesia_end,procedure_name,doctor,nurse) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", vals)
+            else: self.store.conn.execute("UPDATE patients SET history_number=?,full_name=?,age=?,operation_kind=?,department=?,operation_date=?,diagnosis=?,anesthesia_type=?,anesthesia_start=?,anesthesia_end=?,procedure_name=?,doctor=?,nurse=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (*vals, self.editing_patient_id))
             self.store.conn.commit()
         except sqlite3.IntegrityError:
             self.show_validation_error("Не удалось сохранить", "Проверьте обязательные поля записи.")
@@ -1980,11 +1992,13 @@ class JournalWindow(QMainWindow):
         mapping = {"history":"history_number","name":"full_name","age":"age","date":"operation_date","diagnosis":"diagnosis","anesthesia":"anesthesia_type","start":"anesthesia_start","end":"anesthesia_end","procedure":"procedure_name","doctor":"doctor","nurse":"nurse"}
         for key,column in mapping.items():
             target=self.fields[key]; value=str(row[column] or ""); target.setCurrentText(value) if isinstance(target,QComboBox) else target.setText(value)
+        self.set_department(str(row["department"] or ""))
         self.kind_planned.setChecked(row["operation_kind"] == "Плановая"); self.kind_emergency.setChecked(row["operation_kind"] == "Экстренная"); self.form_title.setText("Редактирование пациента"); self.save_button.setText("Сохранить изменения"); self.cancel_button.show(); self.delete_patient_button.show(); self.update_duration()
 
     def cancel_edit(self) -> None:
         self.editing_patient_id=None
         for key, target in self.fields.items(): target.setCurrentText("") if isinstance(target,QComboBox) else target.setText("")
+        self.set_department("")
         self.fields["date"].setText(date.today().isoformat()); self.kind_planned.setChecked(True); self.form_title.setText("Быстрое добавление"); self.save_button.setText("Добавить пациента"); self.cancel_button.hide(); self.delete_patient_button.hide(); self.update_duration()
 
     def delete_patient(self) -> None:

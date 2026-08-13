@@ -13,6 +13,7 @@ PATIENT_COLUMNS = (
     "full_name",
     "age",
     "operation_kind",
+    "department",
     "operation_date",
     "diagnosis",
     "anesthesia_type",
@@ -35,6 +36,7 @@ def _create_patients_table(connection: sqlite3.Connection) -> None:
             full_name TEXT NOT NULL,
             age INTEGER,
             operation_kind TEXT NOT NULL,
+            department TEXT,
             operation_date TEXT NOT NULL,
             diagnosis TEXT,
             anesthesia_type TEXT NOT NULL,
@@ -87,7 +89,13 @@ def _migrate_repeated_patient_cases(connection: sqlite3.Connection) -> None:
     try:
         connection.execute(f"ALTER TABLE patients RENAME TO {legacy_table}")
         _create_patients_table(connection)
-        columns = ", ".join(PATIENT_COLUMNS)
+        legacy_columns = {
+            str(row[1])
+            for row in connection.execute(f"PRAGMA table_info({legacy_table})").fetchall()
+        }
+        columns = ", ".join(
+            column for column in PATIENT_COLUMNS if column in legacy_columns
+        )
         connection.execute(
             f"INSERT INTO patients ({columns}) SELECT {columns} FROM {legacy_table}"
         )
@@ -108,14 +116,17 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         )
 
     _create_patients_table(connection)
+    if _history_number_is_unique(connection):
+        _migrate_repeated_patient_cases(connection)
+
     actual_columns = {
         str(row[1]) for row in connection.execute("PRAGMA table_info(patients)").fetchall()
     }
-    if not set(PATIENT_COLUMNS).issubset(actual_columns):
+    missing_columns = set(PATIENT_COLUMNS) - actual_columns
+    if missing_columns == {"department"}:
+        connection.execute("ALTER TABLE patients ADD COLUMN department TEXT")
+    elif missing_columns:
         raise sqlite3.DatabaseError("Структура выбранной базы данных не поддерживается")
-
-    if _history_number_is_unique(connection):
-        _migrate_repeated_patient_cases(connection)
 
     _create_patients_indexes(connection)
     if version < DATABASE_SCHEMA_VERSION:
