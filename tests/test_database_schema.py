@@ -4,7 +4,7 @@ import sqlite3
 import unittest
 
 from app_version import DATABASE_SCHEMA_VERSION
-from database_schema import initialize_schema
+from database_schema import NewerDatabaseSchemaError, initialize_schema
 
 
 OLD_SCHEMA = """
@@ -129,8 +129,10 @@ class DatabaseSchemaTests(unittest.TestCase):
         connection = sqlite3.connect(":memory:")
         connection.execute(f"PRAGMA user_version={DATABASE_SCHEMA_VERSION + 1}")
 
-        with self.assertRaisesRegex(sqlite3.DatabaseError, "более новой версией"):
+        with self.assertRaisesRegex(NewerDatabaseSchemaError, "более новой версией") as raised:
             initialize_schema(connection)
+        self.assertEqual(raised.exception.database_version, DATABASE_SCHEMA_VERSION + 1)
+        self.assertEqual(raised.exception.supported_version, DATABASE_SCHEMA_VERSION)
 
 
 if __name__ == "__main__":

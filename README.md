@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/версия-1.0.5-1769e0?style=flat-square" alt="Версия 1.0.5">
+  <img src="https://img.shields.io/badge/версия-1.0.6-1769e0?style=flat-square" alt="Версия 1.0.6">
   <img src="https://img.shields.io/badge/платформа-Windows-1769e0?style=flat-square" alt="Платформа Windows">
   <img src="https://img.shields.io/badge/Python-3.10%2B-3776ab?style=flat-square" alt="Python 3.10 или новее">
   <img src="https://img.shields.io/badge/UI-PySide6-41cd52?style=flat-square" alt="Интерфейс PySide6">
@@ -134,7 +134,7 @@ python build_release.py
 ```text
 dist/
 ├── JournalPatients/          # переносимая onedir-сборка
-└── JournalPatients-1.0.5.zip # архив релиза
+└── JournalPatients-1.0.6.zip # архив релиза
 ```
 
 Для публикации в общую папку обновлений:
@@ -143,7 +143,7 @@ dist/
 python build_release.py --publish-root "\\server\share\Jornal-oper"
 ```
 
-Сценарий создаёт версионный архив, вычисляет SHA-256 и атомарно обновляет `UPD/latest.json`. Установленная сборка проверяет более новую версию при закрытии приложения.
+Сценарий создаёт версионный архив, вычисляет SHA-256 и атомарно обновляет `UPD/latest.json`. Установленная сборка проверяет более новую версию при закрытии приложения, а если база уже требует новую схему — до открытия главного окна.
 
 > Единый источник версии — [`app_version.py`](./app_version.py). Версия исходного кода может быть новее последнего опубликованного GitHub Release.
 

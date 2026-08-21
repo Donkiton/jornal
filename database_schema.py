@@ -27,6 +27,17 @@ PATIENT_COLUMNS = (
 )
 
 
+class NewerDatabaseSchemaError(sqlite3.DatabaseError):
+    """База требует более новую версию приложения."""
+
+    def __init__(self, database_version: int, supported_version: int) -> None:
+        self.database_version = database_version
+        self.supported_version = supported_version
+        super().__init__(
+            "База создана более новой версией программы. Обновите приложение."
+        )
+
+
 def _create_patients_table(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
@@ -111,9 +122,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     """Создаёт актуальную схему и обновляет совместимую старую базу."""
     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     if version > DATABASE_SCHEMA_VERSION:
-        raise sqlite3.DatabaseError(
-            "База создана более новой версией программы. Обновите приложение."
-        )
+        raise NewerDatabaseSchemaError(version, DATABASE_SCHEMA_VERSION)
 
     _create_patients_table(connection)
     if _history_number_is_unique(connection):
