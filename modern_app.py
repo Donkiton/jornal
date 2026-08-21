@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from app_version import APP_VERSION
-from database_schema import initialize_schema
+from database_schema import NewerDatabaseSchemaError, initialize_schema
 from update_system import ReleaseInfo, apply_staged_update, find_newer_release, prepare_release
 
 
@@ -476,6 +476,7 @@ class DataStore:
         self.conn: sqlite3.Connection | None = None
         self.connected_root: Path | None = None
         self.error = ""
+        self.update_required = False
 
     @staticmethod
     def validated_settings(source: dict, root: Path | None = None) -> dict:
@@ -602,6 +603,7 @@ class DataStore:
 
     def connect(self, value: str | Path | None = None) -> bool:
         target = normalize_database_root(value) if value is not None else self.database_root
+        self.update_required = False
         if target is None:
             self.error = "Папка базы данных не выбрана"
             return False
@@ -625,6 +627,15 @@ class DataStore:
                     pass
             self.error = ""
             return True
+        except NewerDatabaseSchemaError as exc:
+            self.update_required = True
+            self.error = str(exc)
+            if new_connection:
+                try:
+                    new_connection.close()
+                except sqlite3.Error:
+                    pass
+            return False
         except (OSError, sqlite3.Error) as exc:
             self.error = str(exc)
             if new_connection:
@@ -1343,6 +1354,25 @@ class ApplyUpdateWorker(QObject):
             self.failed.emit(str(exc))
 
 
+def launch_staged_update_installer(stage_dir: Path, target_version: str) -> None:
+    """Запускает подготовленную новую версию в режиме установщика."""
+    executable = stage_dir / "JournalPatients.exe"
+    command = [
+        str(executable),
+        "--apply-update",
+        "--target", str(APP_DIR),
+        "--parent-pid", str(os.getpid()),
+        "--from-version", APP_VERSION,
+        "--version", target_version,
+    ]
+    subprocess.Popen(
+        command,
+        cwd=str(stage_dir),
+        close_fds=True,
+        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+    )
+
+
 def open_database_root(
     store: DataStore,
     value: str | Path,
@@ -1362,7 +1392,8 @@ def open_database_root(
 
     if not store.connect(root):
         instance_lock.release()
-        return None, "access", store.error
+        status = "update_required" if store.update_required else "access"
+        return None, status, store.error
 
     try:
         # Общий settings.json становится активным только после успешного
@@ -1576,22 +1607,8 @@ class JournalWindow(QMainWindow):
         if self._pending_release is None or self.update_dialog is None:
             return
         self.update_dialog.set_progress(70, "Запуск установщика обновления")
-        executable = stage_dir / "JournalPatients.exe"
-        command = [
-            str(executable),
-            "--apply-update",
-            "--target", str(APP_DIR),
-            "--parent-pid", str(os.getpid()),
-            "--from-version", APP_VERSION,
-            "--version", self._pending_release.version,
-        ]
         try:
-            subprocess.Popen(
-                command,
-                cwd=str(stage_dir),
-                close_fds=True,
-                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-            )
+            launch_staged_update_installer(stage_dir, self._pending_release.version)
         except OSError as exc:
             self.update_failed(str(exc))
             return
@@ -2181,10 +2198,60 @@ def run_update_installer(app: QApplication, arguments: argparse.Namespace) -> in
     return app.exec()
 
 
+def run_startup_update(app: QApplication, release: ReleaseInfo) -> int:
+    """Устанавливает обновление, когда новая схема БД не даёт открыть журнал."""
+    dialog = UpdateProgressDialog(
+        APP_VERSION,
+        release.version,
+        "Закрыть",
+        None,
+    )
+    thread_holder: dict[str, object] = {}
+
+    def update_prepared(stage_dir: Path) -> None:
+        dialog.set_progress(70, "Запуск установщика обновления")
+        try:
+            launch_staged_update_installer(stage_dir, release.version)
+        except OSError as exc:
+            dialog.set_error(str(exc))
+            return
+        dialog.hide()
+        app.quit()
+
+    def start_worker() -> None:
+        existing = thread_holder.get("thread")
+        if isinstance(existing, QThread) and existing.isRunning():
+            return
+        dialog.reset_for_retry()
+        dialog.details.setText(
+            "База данных требует более новую версию программы. "
+            "Обновление будет установлено до открытия журнала."
+        )
+        worker = PrepareUpdateWorker(release)
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(dialog.set_progress)
+        worker.finished.connect(update_prepared)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(dialog.set_error)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread_holder["thread"] = thread
+        thread_holder["worker"] = worker
+        thread.start()
+
+    dialog.retry_requested.connect(start_worker)
+    dialog.accepted.connect(app.quit)
+    dialog.show()
+    start_worker()
+    return app.exec()
+
+
 def establish_startup_database(
     store: DataStore,
     splash: QSplashScreen,
-) -> ProgramInstanceLock | None:
+) -> tuple[ProgramInstanceLock | None, ReleaseInfo | None]:
     root = store.database_root
     persist = False
     while True:
@@ -2194,7 +2261,7 @@ def establish_startup_database(
             if picker.exec() != QDialog.DialogCode.Accepted:
                 if ACTIVE_STARTUP_LOGGER:
                     ACTIVE_STARTUP_LOGGER.log("Запуск отменён: папка журнала не выбрана")
-                return None
+                return None, None
             root = picker.selected_path()
             persist = True
             if root is None:
@@ -2206,7 +2273,7 @@ def establish_startup_database(
             QApplication.processEvents()
             if ACTIVE_STARTUP_LOGGER:
                 ACTIVE_STARTUP_LOGGER.log("Общая база подключена")
-            return instance_lock
+            return instance_lock, None
 
         splash.close()
         if status == "locked":
@@ -2218,7 +2285,25 @@ def establish_startup_database(
                 "Закройте его там, прежде чем продолжить работу здесь.",
                 None,
             ).exec()
-            return None
+            return None, None
+
+        if status == "update_required":
+            if ACTIVE_STARTUP_LOGGER:
+                ACTIVE_STARTUP_LOGGER.log("Схема базы требует обновления программы")
+            try:
+                release = find_newer_release(root / "UPD", APP_VERSION)
+            except OSError:
+                release = None
+            if release is not None:
+                return None, release
+            ValidationErrorDialog(
+                "Требуется обновление",
+                "База данных создана более новой версией программы, "
+                "но доступное автоматическое обновление не найдено. "
+                "Проверьте доступ к папке UPD или обратитесь к администратору.",
+                None,
+            ).exec()
+            return None, None
 
         if ACTIVE_STARTUP_LOGGER:
             ACTIVE_STARTUP_LOGGER.log("Общая база недоступна")
@@ -2229,11 +2314,11 @@ def establish_startup_database(
         if action == DatabaseAccessDialog.CHOOSE_ANOTHER:
             picker = DatabaseFolderDialog(str(root))
             if picker.exec() != QDialog.DialogCode.Accepted:
-                return None
+                return None, None
             root = picker.selected_path()
             persist = True
             continue
-        return None
+        return None, None
 
 
 def main() -> int:
@@ -2258,7 +2343,18 @@ def main() -> int:
     app.processEvents()
     ACTIVE_STARTUP_LOGGER.log("Стартовая заставка показана")
     store = DataStore()
-    instance_lock = establish_startup_database(store, splash)
+    instance_lock, startup_release = establish_startup_database(store, splash)
+    if startup_release is not None:
+        splash.close()
+        if not IS_FROZEN:
+            ValidationErrorDialog(
+                "Требуется обновление",
+                f"Найдена версия {startup_release.version}. "
+                "Автоматическая установка доступна в собранной версии программы.",
+                None,
+            ).exec()
+            return 0
+        return run_startup_update(app, startup_release)
     if instance_lock is None:
         return 0
     ACTIVE_STARTUP_LOGGER.set_enabled(store.settings.get("startup_logging") is True)
