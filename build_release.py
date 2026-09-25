@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -60,11 +61,23 @@ VSVersionInfo(
     )
 
 
+def clean_build_environment() -> dict[str, str]:
+    """Не даёт PyInstaller собирать посторонние DLL из пользовательского PATH."""
+    environment = os.environ.copy()
+    python_dir = Path(sys.executable).resolve().parent
+    windows_dir = Path(environment.get("SystemRoot", r"C:\Windows"))
+    environment["PATH"] = os.pathsep.join(
+        str(path) for path in (python_dir, python_dir / "Scripts", windows_dir / "System32", windows_dir)
+    )
+    return environment
+
+
 def build_application() -> None:
     generate_windows_version_file()
     subprocess.run(
         [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "JournalPatients.spec"],
         cwd=PROJECT_DIR,
+        env=clean_build_environment(),
         check=True,
     )
 
@@ -82,6 +95,32 @@ def create_release_archive() -> Path:
                 archive.write(item, item.relative_to(APP_BUILD_DIR))
     os.replace(temporary_path, archive_path)
     return archive_path
+
+
+def verify_release_archive(archive_path: Path) -> None:
+    """Проверяет запуск Qt из распакованного пакета до публикации."""
+    with tempfile.TemporaryDirectory(prefix="jornal-check-", dir=DIST_DIR) as directory:
+        stage_dir = Path(directory) / "package"
+        with zipfile.ZipFile(archive_path) as archive:
+            bad_entry = archive.testzip()
+            if bad_entry:
+                raise ValueError(f"Повреждён файл архива: {bad_entry}")
+            archive.extractall(stage_dir)
+        environment = os.environ.copy()
+        environment["LOCALAPPDATA"] = str(Path(directory) / "state")
+        environment["APPDATA"] = environment["LOCALAPPDATA"]
+        environment["QT_QPA_PLATFORM"] = "offscreen"
+        result = subprocess.run(
+            [str(stage_dir / "JournalPatients.exe"), "--self-test"],
+            cwd=stage_dir,
+            env=environment,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("Проверка запуска релиза завершилась ошибкой:\n" + result.stderr[-2000:])
 
 
 def sha256(path: Path) -> str:
@@ -130,6 +169,7 @@ def main() -> int:
     arguments = parser.parse_args()
     build_application()
     archive = create_release_archive()
+    verify_release_archive(archive)
     print(f"Сборка: {APP_BUILD_DIR}")
     print(f"Архив: {archive}")
     if arguments.publish_root:

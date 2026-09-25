@@ -164,6 +164,43 @@ class PatientCasesUiTests(unittest.TestCase):
     def test_department_is_optional_and_not_selected_by_default(self) -> None:
         self.assertIsNone(self.window.department_group.checkedButton())
 
+    def test_staff_variants_are_saved_and_counted_under_reference_names(self) -> None:
+        self.store.settings["doctors"] = ["Петров И.П."]
+        self.store.settings["nurses"] = ["Ти Н В", "Ти Н.В."]
+        self.store.conn.executemany(
+            """INSERT INTO patients
+               (history_number, full_name, operation_kind, operation_date,
+                anesthesia_type, doctor, nurse)
+               VALUES (?, ?, 'Плановая', '2026-08-03', 'Общая', ?, ?)""",
+            [
+                ("old-1", "Случай 1", "Петров и п", "Ти н в"),
+                ("old-2", "Случай 2", "Петров И. П.", "Ти Н. В."),
+            ],
+        )
+        self.store.conn.commit()
+
+        self.window.fields["history"].setText("new-1")
+        self.window.fields["name"].setText("Новый случай")
+        self.window.fields["anesthesia"].setCurrentText("Общая")
+        self.window.fields["doctor"].setCurrentText("ПЕТРОВ И П")
+        self.window.fields["nurse"].setCurrentText("Ти Н в")
+        self.window.save_patient()
+
+        saved = self.store.conn.execute(
+            "SELECT doctor, nurse FROM patients WHERE history_number='new-1'"
+        ).fetchone()
+        self.assertEqual(tuple(saved), ("Петров И.П.", "Ти Н.В."))
+        historical = self.store.conn.execute(
+            "SELECT nurse FROM patients WHERE history_number='old-1'"
+        ).fetchone()[0]
+        self.assertEqual(historical, "Ти н в")
+
+        self.window.refresh_report()
+        self.assertEqual(self.window.report_doctor_table.item(0, 0).text(), "Петров И.П.")
+        self.assertEqual(self.window.report_doctor_table.item(0, 1).text(), "3")
+        self.assertEqual(self.window.report_nurse_table.item(0, 0).text(), "Ти Н.В.")
+        self.assertEqual(self.window.report_nurse_table.item(0, 1).text(), "3")
+
     def test_maximized_quick_form_has_no_horizontal_scrollbar(self) -> None:
         self.window.showMaximized()
         self.application.processEvents()

@@ -59,10 +59,10 @@ class StartupUpdateTests(unittest.TestCase):
     def test_startup_returns_published_update_for_newer_database(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            package = root / "UPD" / "releases" / "1.0.6" / "package.zip"
+            package = root / "UPD" / "releases" / "1.0.9" / "package.zip"
             package.parent.mkdir(parents=True)
             package.write_bytes(b"package")
-            release = ReleaseInfo("1.0.6", package, "0" * 64, package.stat().st_size)
+            release = ReleaseInfo("1.0.9", package, "0" * 64, package.stat().st_size)
             store = Mock()
             store.database_root = root
             splash = Mock()
