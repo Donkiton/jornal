@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 
 from app_version import APP_VERSION
 from database_schema import NewerDatabaseSchemaError, initialize_schema
+from staff_names import canonical_staff_name, merge_staff_counts
 from update_system import ReleaseInfo, apply_staged_update, find_newer_release, prepare_release
 
 
@@ -1869,8 +1870,8 @@ class JournalWindow(QMainWindow):
             self.store.error = str(exc); self.store.close(); self.refresh_patient_state(); return
         self.report_total.setText(str(total)); self.report_planned.setText(str(planned)); self.report_emergency.setText(str(emergency))
         self.fill_report_table(self.report_anesthesia_table, anesthesia, total)
-        self.fill_report_table(self.report_doctor_table, doctors, total)
-        self.fill_report_table(self.report_nurse_table, nurses, total)
+        self.fill_report_table(self.report_doctor_table, merge_staff_counts(doctors, self.store.settings["doctors"]), total)
+        self.fill_report_table(self.report_nurse_table, merge_staff_counts(nurses, self.store.settings["nurses"]), total)
         period = "за всё время" if not params else "за выбранный период"
         self.report_status.setText(f"Сформировано {period}. Всего записей: {total}.")
 
@@ -1990,7 +1991,9 @@ class JournalWindow(QMainWindow):
         if not self.store.conn: return
         data = self.form_data()
         if not self.validate(data): return
-        vals = (data["history"], data["name"], int(data["age"]) if data["age"] else None, data["kind"], data["department"], data["date"], data["diagnosis"], data["anesthesia"], data["start"], data["end"], data["procedure"], data["doctor"], data["nurse"])
+        doctor = canonical_staff_name(data["doctor"], self.store.settings["doctors"])
+        nurse = canonical_staff_name(data["nurse"], self.store.settings["nurses"])
+        vals = (data["history"], data["name"], int(data["age"]) if data["age"] else None, data["kind"], data["department"], data["date"], data["diagnosis"], data["anesthesia"], data["start"], data["end"], data["procedure"], doctor, nurse)
         try:
             if self.editing_patient_id is None: self.store.conn.execute("INSERT INTO patients(history_number,full_name,age,operation_kind,department,operation_date,diagnosis,anesthesia_type,anesthesia_start,anesthesia_end,procedure_name,doctor,nurse) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", vals)
             else: self.store.conn.execute("UPDATE patients SET history_number=?,full_name=?,age=?,operation_kind=?,department=?,operation_date=?,diagnosis=?,anesthesia_type=?,anesthesia_start=?,anesthesia_end=?,procedure_name=?,doctor=?,nurse=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (*vals, self.editing_patient_id))
@@ -2152,6 +2155,7 @@ class JournalWindow(QMainWindow):
 
 def parse_arguments(arguments: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--apply-update", action="store_true")
     parser.add_argument("--target", default="")
     parser.add_argument("--parent-pid", type=int, default=0)
@@ -2323,8 +2327,13 @@ def establish_startup_database(
 
 def main() -> int:
     global ACTIVE_STARTUP_LOGGER
-    migrate_legacy_settings()
     arguments = parse_arguments(sys.argv)
+    if arguments.self_test:
+        # Проверка импортов и DLL без обращения к рабочей базе данных.
+        QApplication([sys.argv[0]])
+        return 0
+
+    migrate_legacy_settings()
     app = QApplication(sys.argv)
     # Fusion не использует нестабильные растровые эффекты WindowsVistaStyle
     # при наведении и фокусе, из-за которых Qt мог выводить QPainter-предупреждения.
